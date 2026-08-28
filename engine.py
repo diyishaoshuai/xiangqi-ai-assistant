@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+import os
+import logging
+import re
+import subprocess
+import threading
+from collections import deque
+from pathlib import Path
+
+from core import AnalysisLine
+
+
+INFO_RE = re.compile(
+    r"\bdepth (?P<depth>\d+).*?\bmultipv (?P<multipv>\d+).*?"
+    r"\bscore (?P<score_type>cp|mate) (?P<score>-?\d+).*?\bpv (?P<pv>.+)$"
+)
+WDL_RE = re.compile(r"\bwdl (?P<win>\d+) (?P<draw>\d+) (?P<loss>\d+)\b")
+LOGGER = logging.getLogger("xiangqi_ai.engine")
+
+
+class EngineError(RuntimeError):
+    pass
+
+
+class PikafishEngine:
+    def __init__(self, executable: Path, threads: int = 4, hash_mb: int = 256):
+        self.executable = executable
+        self.process: subprocess.Popen[str] | None = None
+        self._write_lock = threading.Lock()
+        self._search_lock = threading.Lock()
+        self.threads = threads
+        self.hash_mb = hash_mb
+
+    def start(self) -> None:
+        if self.process and self.process.poll() is None:
+            return
+        if not self.executable.exists():
+            raise EngineError(f"找不到引擎：{self.executable}")
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        self.process = subprocess.Popen(
+            [str(self.executable)],
+            cwd=str(self.executable.parent),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=flags,
+        )
+        self._send("uci")
+        self._read_until("uciok")
+        self._send(f"setoption name Threads value {self.threads}")
+        self._send(f"setoption name Hash value {self.hash_mb}")
+        self._send("setoption name UCI_ShowWDL value true")
+        # Pikafish on Windows may fail to open an NNUE path containing CJK
+        # characters. The engine process already runs in executable.parent, so
+        # prefer a short relative path even when the app itself is installed in
+        # a Chinese-named directory.
+        if (self.executable.parent / "pikafish.nnue").exists():
+            self._send("setoption name EvalFile value pikafish.nnue")
+        elif (self.executable.parent.parent / "pikafish.nnue").exists():
+            self._send(r"setoption name EvalFile value ..\pikafish.nnue")
+        self._send("isready")
+        self._read_until("readyok")
+
+    def _send(self, command: str) -> None:
+        if not self.process or not self.process.stdin:
+            raise EngineError("引擎尚未启动")
+        with self._write_lock:
+            self.process.stdin.write(command + "\n")
+            self.process.stdin.flush()
+
+    def _read_until(self, token: str) -> list[str]:
+        if not self.process or not self.process.stdout:
+            raise EngineError("引擎尚未启动")
+        lines: list[str] = []
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                raise EngineError("引擎意外退出")
+            clean = line.strip()
+            lines.append(clean)
+            if clean == token or clean.startswith(token + " "):
+                return lines
+
+    def analyse(
+        self,
+        fen: str,
+        movetime_ms: int,
+        multipv: int,
+        *,
+        history_fen: str | None = None,
+        moves: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[list[AnalysisLine], str]:
+        with self._search_lock:
+            self.start()
+            move_history = list(moves or ())
+            LOGGER.info(
+                "analysis start fen=%s history_fen=%s moves=%s movetime_ms=%s multipv=%s",
+                fen,
+                history_fen or fen,
+                " ".join(move_history) or "-",
+                movetime_ms,
+                multipv,
+            )
+            self._send(f"setoption name MultiPV value {multipv}")
+            position_command = f"position fen {history_fen or fen}"
+            if move_history:
+                position_command += " moves " + " ".join(move_history)
+            self._send(position_command)
+            self._send(f"go movetime {movetime_ms}")
+            if not self.process or not self.process.stdout:
+                raise EngineError("引擎尚未启动")
+            latest: dict[int, AnalysisLine] = {}
+            bestmove = ""
+            output_tail: deque[str] = deque(maxlen=12)
+            while True:
+                line = self.process.stdout.readline()
+                if line == "":
+                    details = "\n".join(output_tail)
+                    suffix = f"\n\n引擎最后输出：\n{details}" if details else ""
+                    raise EngineError(f"分析过程中引擎退出{suffix}")
+                clean = line.strip()
+                if clean:
+                    output_tail.append(clean)
+                    LOGGER.debug("engine << %s", clean)
+                match = INFO_RE.search(clean)
+                if match:
+                    wdl_match = WDL_RE.search(clean)
+                    wdl = (
+                        (
+                            int(wdl_match.group("win")),
+                            int(wdl_match.group("draw")),
+                            int(wdl_match.group("loss")),
+                        )
+                        if wdl_match
+                        else None
+                    )
+                    item = AnalysisLine(
+                        multipv=int(match.group("multipv")),
+                        depth=int(match.group("depth")),
+                        score_type=match.group("score_type"),
+                        score=int(match.group("score")),
+                        pv=match.group("pv").split(),
+                        wdl=wdl,
+                    )
+                    latest[item.multipv] = item
+                if clean.startswith("bestmove "):
+                    parts = clean.split()
+                    bestmove = parts[1] if len(parts) > 1 else ""
+                    break
+            result = [latest[key] for key in sorted(latest)]
+            if result:
+                top = result[0]
+                LOGGER.info(
+                    "analysis done bestmove=%s depth=%s score=%s:%s wdl=%s",
+                    bestmove,
+                    top.depth,
+                    top.score_type,
+                    top.score,
+                    top.wdl,
+                )
+            else:
+                LOGGER.info("analysis done bestmove=%s no analysis lines", bestmove)
+            return result, bestmove
+
+    def stop(self) -> None:
+        if self.process and self.process.poll() is None:
+            try:
+                self._send("stop")
+            except (BrokenPipeError, EngineError):
+                pass
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if not process or process.poll() is not None:
+            return
+        try:
+            if process.stdin:
+                process.stdin.write("quit\n")
+                process.stdin.flush()
+            process.wait(timeout=1.5)
+        except Exception:
+            process.terminate()
