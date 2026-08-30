@@ -19,8 +19,13 @@ a = Analysis(
     binaries=[(str(engine_exe), "engine")],
     datas=[
         (str(engine_nnue), "engine"),
+        (str(pikafish / "Copying.txt"), "licenses/pikafish"),
+        (str(pikafish / "AUTHORS"), "licenses/pikafish"),
+        (str(pikafish / "NNUE-License.md"), "licenses/pikafish"),
         (str(project / "vision_models"), "vision_models"),
         (str(project / "vision_licenses"), "licenses/vision"),
+        (str(project / "README.md"), "."),
+        (str(project / "THIRD_PARTY_NOTICES.md"), "."),
     ],
     hiddenimports=["cv2", "numpy", "onnxruntime"],
     noarchive=False,
