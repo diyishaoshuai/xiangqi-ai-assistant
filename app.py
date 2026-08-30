@@ -44,6 +44,8 @@ from core import (
     validate_position,
 )
 from engine import EngineError, PikafishEngine
+from app_paths import resource_base as app_base
+from diagnostics import APP_VERSION, configure_logging, install_exception_logging
 from automation import (
     AutomationState,
     ConfirmationKind,
@@ -175,46 +177,6 @@ def _checking_line_should_yield(
     return not (line.score_type == "mate" and 0 < line.score <= 5)
 
 
-def app_base() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    return Path(__file__).resolve().parent
-
-
-def install_base() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def configure_logging() -> Path:
-    preferred = install_base() / "logs"
-    fallback = Path(os.environ.get("LOCALAPPDATA", install_base())) / "XiangqiAI" / "logs"
-    log_dir = preferred
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        log_dir = fallback
-        log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "xiangqi-ai.log"
-    logger = logging.getLogger("xiangqi_ai")
-    logger.setLevel(logging.DEBUG)
-    if not any(isinstance(handler, RotatingFileHandler) for handler in logger.handlers):
-        handler = RotatingFileHandler(
-            log_path,
-            maxBytes=2 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        handler.setLevel(logging.DEBUG)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-        )
-        logger.addHandler(handler)
-        logger.propagate = False
-    return log_path
-
-
 def find_engine() -> Path:
     base = app_base()
     configured = os.environ.get("PIKAFISH_DIR")
@@ -243,14 +205,28 @@ class XiangqiApp:
 
     def __init__(self, root: tk.Tk):
         self.log_path = configure_logging()
+        install_exception_logging()
         self.logger = logging.getLogger("xiangqi_ai.app")
-        self.logger.info("application session started")
+        self.logger.info("application session started version=%s resource_base=%s", APP_VERSION, app_base())
         self.root = root
+        original_report = root.report_callback_exception
+
+        def report_callback_exception(exc_type, exc_value, traceback):
+            self.logger.error("Tk callback exception", exc_info=(exc_type, exc_value, traceback))
+            original_report(exc_type, exc_value, traceback)
+
+        root.report_callback_exception = report_callback_exception
         self.root.title(APP_NAME)
         self.root.geometry("1280x820")
         self.root.minsize(1120, 740)
         self.root.configure(bg=BG)
         self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
+        menu = tk.Menu(self.root)
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="使用说明", command=lambda: self.show_help_document(False))
+        help_menu.add_command(label="第三方说明与许可证", command=lambda: self.show_help_document(True))
+        menu.add_cascade(label="帮助", menu=help_menu)
+        self.root.config(menu=menu)
 
         self.board, self.side = parse_fen(PUZZLE_FEN)
         self.assisted_side = "w"
@@ -630,6 +606,33 @@ class XiangqiApp:
             self.status_var.set(f"已打开日志：{self.log_path}")
         except OSError as exc:
             messagebox.showerror("无法打开日志", f"{self.log_path}\n\n{exc}")
+
+    def show_help_document(self, licenses: bool = False):
+        base = app_base()
+        paths = [base / ("THIRD_PARTY_NOTICES.md" if licenses else "README.md")]
+        if licenses:
+            paths.extend(sorted(path for path in (base / "licenses").rglob("*") if path.is_file()))
+            if not (base / "licenses").exists():
+                paths.extend(sorted((base / "vision_licenses").glob("*.txt")))
+                paths.extend(find_engine().parent.parent / name for name in ("Copying.txt", "NNUE-License.md", "AUTHORS"))
+        try:
+            content = "\n\n".join(f"--- {path.name} ---\n\n{path.read_text(encoding='utf-8', errors='replace')}"
+                                      for path in paths if path.is_file())
+        except OSError as exc:
+            self.logger.exception("unable to read bundled documentation")
+            messagebox.showerror("无法打开说明", str(exc))
+            return None
+        window = tk.Toplevel(self.root)
+        window.title("第三方说明与许可证" if licenses else "使用说明")
+        window.geometry("880x640")
+        scrollbar = ttk.Scrollbar(window)
+        scrollbar.pack(side="right", fill="y")
+        document = tk.Text(window, wrap="word", padx=16, pady=12, yscrollcommand=scrollbar.set)
+        document.pack(fill="both", expand=True)
+        scrollbar.config(command=document.yview)
+        document.insert("1.0", content)
+        document.config(state="disabled")
+        return window
 
     def _canvas_point(self, square: tuple[int, int]) -> tuple[float, float]:
         x, y = square
@@ -2486,11 +2489,59 @@ class XiangqiApp:
             self._schedule_auto_analysis(350)
 
     def _on_close(self) -> None:
+        if self.closing:
+            return
         self.closing = True
+        self.mouse_auto_pending_start = False
         self.mouse_auto_stop_event.set()
         self._invalidate_analysis()
-        self.engine.close()
-        self.root.destroy()
+        try:
+            self.engine.close()
+        finally:
+            logger = logging.getLogger("xiangqi_ai")
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
+            self.root.destroy()
+
+
+def uninstall_smoke_session() -> None:
+    """Hidden, non-clicking integration fixture for installer verification."""
+    root = tk.Tk()
+    root.withdraw()
+    app = XiangqiApp(root)
+    app.auto_analysis_var.set(False)
+    app._invalidate_analysis()
+    root.withdraw()
+    app.engine.start()
+    if "--seed-uninstall-data" in sys.argv:
+        from recognition import TemplatePieceRecognizer
+
+        learner = TemplatePieceRecognizer()
+        learner.learn("R", [0.0] * 256)
+        for handler in logging.getLogger("xiangqi_ai").handlers:
+            if isinstance(handler, RotatingFileHandler):
+                for _ in range(3):
+                    app.logger.info("uninstall test rollover")
+                    handler.doRollover()
+    app.logger.info("UNINSTALL_SMOKE_READY")
+    if "--runtime-smoke-session" in sys.argv:
+        from build_checks import save_report
+
+        save_report("runtime-smoke.json", {
+            "pid": os.getpid(), "engine_pid": app.engine.process.pid,
+            "resource_base": str(app_base()), "log_path": str(app.log_path),
+        })
+    if "--uninstall-smoke-thinking" in sys.argv:
+        def think_until_closed() -> None:
+            try:
+                app.engine.analyse(PUZZLE_FEN, 60000, 1)
+            except EngineError:
+                if not app.closing:
+                    app.logger.exception("unexpected uninstall fixture engine failure")
+
+        threading.Thread(target=think_until_closed, daemon=True).start()
+    root.mainloop()
 
 
 def main() -> None:
@@ -2953,6 +3004,25 @@ def direct_king_capture_self_test() -> int:
 
 
 if __name__ == "__main__":
+    if "--runtime-probe" in sys.argv:
+        from build_checks import runtime_probe
+
+        raise SystemExit(runtime_probe(sys.modules[__name__]))
+    if "--automation-self-test" in sys.argv:
+        from build_checks import automation_probe
+
+        raise SystemExit(automation_probe())
+    if "--help-self-test" in sys.argv:
+        from build_checks import help_probe
+
+        raise SystemExit(help_probe(sys.modules[__name__]))
+    if "--log-stress-self-test" in sys.argv:
+        from build_checks import log_stress_probe
+
+        raise SystemExit(log_stress_probe())
+    if "--uninstall-smoke-session" in sys.argv or "--runtime-smoke-session" in sys.argv:
+        uninstall_smoke_session()
+        raise SystemExit(0)
     if "--engine-self-test" in sys.argv:
         raise SystemExit(engine_self_test())
     if "--no-win-engine-self-test" in sys.argv:

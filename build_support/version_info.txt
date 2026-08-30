@@ -1,0 +1,15 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2026, 8, 31, 1), prodvers=(2026, 8, 31, 1),
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
+  ),
+  kids=[StringFileInfo([StringTable('040904B0', [
+    StringStruct('CompanyName', 'diyishaoshuai'),
+    StringStruct('FileDescription', 'Xiangqi AI Assistant - Portable'),
+    StringStruct('FileVersion', '2026.8.31.1'),
+    StringStruct('InternalName', 'XiangqiAI'),
+    StringStruct('OriginalFilename', 'XiangqiAI.exe'),
+    StringStruct('ProductName', 'Xiangqi AI Assistant'),
+    StringStruct('ProductVersion', '2026.08.31-portable')
+  ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
+)

@@ -3,8 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import math
-import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +18,7 @@ except ImportError:  # The legacy recognizer remains available as a safe fallbac
     cv2 = np = FULL_CLASSIFIER_ONNX = extract_chessboard = RTMPOSE_ONNX = None
 
 from core import FILES
+from app_paths import resource_base as _runtime_base, user_data_dir
 
 
 # Ratios of the 9x10 intersection rectangle inside this game's 16:9 screenshot.
@@ -182,18 +181,17 @@ class TemplatePieceRecognizer:
         self.templates: dict[str, list[list[float]]] = {
             piece: [_decode_feature(data)] for piece, data in BUILTIN_TEMPLATES.items()
         }
-        local_root = os.environ.get("LOCALAPPDATA")
-        self.data_dir = (
-            Path(local_root) / "XiangqiAI"
-            if local_root
-            else Path.home() / ".xiangqi_ai"
-        )
+        self.data_dir = user_data_dir()
         self.learned_path = self.data_dir / "recognition_templates.json"
         self._load_learned()
 
     def _load_learned(self) -> None:
         try:
-            payload = json.loads(self.learned_path.read_text(encoding="utf-8"))
+            path = self.learned_path
+            if not path.exists():
+                # Older versions used this fallback when LOCALAPPDATA was absent.
+                path = Path.home() / ".xiangqi_ai" / "recognition_templates.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
             for piece, items in payload.items():
                 if piece not in "KABNRCPkabnrcp" or not isinstance(items, list):
                     continue
@@ -278,12 +276,6 @@ class TemplatePieceRecognizer:
                     )
                 )
         return grid, detections
-
-
-def _runtime_base() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    return Path(__file__).resolve().parent
 
 
 class NeuralBoardRecognizer:

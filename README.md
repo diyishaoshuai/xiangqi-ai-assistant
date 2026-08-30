@@ -1,8 +1,27 @@
 # 本地象棋 AI 助手
 
-这是一个完全离线的 Windows 象棋分析工具，使用 Pikafish 2026-01-02 和配套 NNUE 网络。
+完全离线的 Windows 象棋分析工具，使用 Pikafish 2026-01-02 和配套 NNUE 网络。支持截图识别、棋盘编辑、自动分析、执黑视角和 `F1` 自动接管，适用于单机、复盘、学习或规则明确允许的场景。
 
-最新 Windows 完整包可在 [GitHub Releases](https://github.com/diyishaoshuai/xiangqi-ai-assistant/releases) 下载；解压后直接运行 `XiangqiAI.exe`。
+**当前版本：`2026.08.31-portable` · Windows x64 单 EXE 免安装版**
+
+[下载 XiangqiAI.exe](https://github.com/diyishaoshuai/xiangqi-ai-assistant/releases/latest/download/XiangqiAI.exe) · [最新 Release](https://github.com/diyishaoshuai/xiangqi-ai-assistant/releases/latest) · [本版更新说明](docs/releases/v2026.08.31-portable.md) · [反馈问题](https://github.com/diyishaoshuai/xiangqi-ai-assistant/issues)
+
+发给别人只需要 **`XiangqiAI.exe` 一个文件**，双击即可运行。无需安装、Python、另下引擎或单独复制 `_internal` 文件夹；日志和识别学习数据自动存入当前用户的数据目录，不会写到 EXE 旁边。
+
+## 下载与运行要求
+
+1. 打开 [Releases](https://github.com/diyishaoshuai/xiangqi-ai-assistant/releases/latest)，在 **Assets** 中下载 `XiangqiAI.exe`（约 171 MiB）。
+2. 放入自己方便找到的目录，双击运行。建议用普通用户权限，不需要管理员权限。
+3. 分享或换电脑时，直接复制这个 EXE；引擎、NNUE、识别模型和运行库已经内置，使用时不需要联网。
+
+`Source code (zip)` / `Source code (tar.gz)` 是源码，不是运行版；`SHA256SUMS.txt` 仅供可选校验，不是运行依赖。旧版 ZIP 和安装包不是本版的配套文件。
+
+- 目标系统为 Windows 10/11 64 位，本次成品验证在 Windows 11 x64 完成；不提供原生 macOS、Linux、ARM64 或 32 位构建。
+- 引擎使用 x64 SSE4.1/POPCNT 版本；非常老的 CPU 若不支持这些指令，无法运行该引擎。
+- 引擎默认使用最多 8 个 CPU 线程、256 MB 哈希；模型和界面还会使用额外内存。
+- 启动时需要将内置组件解压到系统临时目录，可能需要数秒，并占用数百 MB 临时空间；这是单文件封装的正常行为，正常退出后自动清理。
+
+导航：[快速开始](#快速开始) · [自动接管](#自动接管鼠标) · [数据与升级](#单文件运行日志和升级) · [常见问题](#常见问题) · [源码开发](#源码开发)
 
 ## 快速开始
 
@@ -51,7 +70,7 @@
 - 当深度足够且引擎给出的获胜权重为 0，程序会弹出“建议认输”，并只暂停当前局面的自动跟随，防止在无法取胜的残局中来回循环。
 - 安全暂停不会取消“跟随首选着”的勾选偏好；载入新的可胜局面后会自动恢复，避免漏补上一手推荐着。
 - 即使避循环搜索仍未奏效，同一局面出现 3 次时也会暂停该局面。如果引擎仍判定必胜，程序会提示重新截图同步，不再错误建议认输；只有没有可保持胜势的路线时才建议认输重开。
-- 引擎原始输出和每次判断会写入 `logs/xiangqi-ai.log`。日志最多保留 4 份，每份约 2 MB，便于排查误判或循环。
+- 引擎原始输出和每次判断自动写入 `%LOCALAPPDATA%\XiangqiAI\logs\xiangqi-ai.log`。当前日志达到约 2 MiB 时轮转，另保留 3 份历史日志，总量约 8 MiB；达到上限自动覆盖最旧日志，不按退出删除，无需手动导出。
 - 点击分析区右侧的“打开日志”即可直接查看当前日志。
 
 ## 避免无效连续将军
@@ -69,7 +88,7 @@
 
 ## 强度设置
 
-- `候选 1`：全部算力集中在最佳着，强度最高，推荐实战使用。
+- `候选 1`：全部算力集中在最佳着，适合关注单一最佳走法。
 - `候选 3–5`：同时比较多种走法，适合复盘，但相同时间内搜索会浅一些。
 - 普通残局建议思考 3–5 秒；复杂中局建议 10–30 秒。
 - 引擎默认使用最多 8 个 CPU 线程和 256 MB 哈希。
@@ -90,17 +109,67 @@
 
 深度模型、OpenCV 和 ONNX Runtime 均随程序打包，识别过程完全离线。如果状态栏显示“兼容模板”，表示深度模型没有成功加载或没有可靠定位到棋盘，此时程序会明确弹出警告。
 
-## 文件说明
+## 单文件运行、日志和升级
 
-- `XiangqiAI.exe`：主程序。
-- `_internal/engine/`：Pikafish 引擎和 NNUE 网络，请勿删除。
-- `_internal/vision_models/`：棋盘关键点与全棋盘分类 ONNX 模型，请勿删除。
-- `README.md`：本说明。
-- `THIRD_PARTY_NOTICES.md`、`licenses/`：第三方软件说明与许可证。
+程序文件与运行数据分开存放：
+
+| 内容 | 位置 | 保留方式 |
+| --- | --- | --- |
+| 主程序 | 你放置的 `XiangqiAI.exe` | 手动替换即可升级 |
+| 自动日志 | `%LOCALAPPDATA%\XiangqiAI\logs\xiangqi-ai.log` 及 `.1`～`.3` | 每份约 2 MiB，合计约 8 MiB 滚动保留 |
+| 识别学习数据 | `%LOCALAPPDATA%\XiangqiAI\recognition_templates.json` | 随纠正学习逐步积累，升级和退出不清空 |
+| 临时运行组件 | 通常为 `%TEMP%\_MEI...` | 正常退出后自动清理 |
+
+- 只分发 `dist/XiangqiAI.exe`。引擎、NNUE、ONNX 模型、运行库、说明与许可证均嵌入 EXE；功能与原目录版一致，不需要安装程序。
+- 运行时将组件解压到 Windows 的临时目录（通常为 `%TEMP%\_MEI...`），正常退出后自动回收。解压会增加启动时间，运行时临时空间仍需数百 MB；单文件不代表完全不产生临时文件。断电或整个进程树被强制结束时可能来不及清理，不会因此扫描删除其他软件的临时目录。
+- EXE 所在目录不产生日志、模板或缓存，即使从只读目录运行也不要求写入该目录。
+- 自动日志位于 `%LOCALAPPDATA%\XiangqiAI\logs`，约 8 MiB 滚动保留，程序内原有“打开日志”仍可直接查看。不同进程写入及轮转会互斥，避免多开时争用同一日志；日志不自动上传。8 MiB 仅指日志，不包含识别学习数据和临时组件。
+- 识别学习数据位于 `%LOCALAPPDATA%\XiangqiAI\recognition_templates.json`，与旧版位置相同，已有学习数据继续使用。旧备用目录 `%USERPROFILE%\.xiangqi_ai` 的模板可兼容读取。程序从不把截图保存为学习数据。
+- 升级时先退出程序，再替换 EXE，用户数据无需移动。删除 EXE 仅删除程序，日志和学习数据会保留；不再使用且要移除数据时，可在退出所有副本后删除软件专属的 `%LOCALAPPDATA%\XiangqiAI` 目录，不要删除整个 AppData。
+- 单文件版不创建卸载记录、桌面/开始菜单快捷方式、服务、计划任务或自启动项。Windows 自己维护的系统日志、预读取等记录不作系统级擦除。
+- 原有安装版不会被单文件版自动卸载，旧安装包和 `installer/` 目录仅保留作历史维护，不再作为当前交付方式。请不要把新 EXE 放进旧版安装目录再运行旧卸载程序；旧卸载程序也会清理共用的用户数据，需要保留模板时先备份。
+
+从安装版迁移时，先退出所有旧版和新版副本，备份 `%LOCALAPPDATA%\XiangqiAI`，再处理旧版卸载。将新 EXE 放在独立目录；如需继续使用学习数据，在旧版卸载完成后恢复 `recognition_templates.json` 即可。单 EXE 不会自动修复其他电脑上的历史卸载残留。
+
+## 常见问题
+
+**为什么一个 EXE 还需要临时文件？**
+
+“单文件”指只需分发一个文件，不是完全不写磁盘。引擎和原生推理库运行时需要临时解压；自动日志与学习数据需要持久保留。程序不会在 EXE 所在目录生成这些文件。
+
+**如何找到日志，方便排查和优化？**
+
+点击程序中的“打开日志”，或在资源管理器地址栏输入 `%LOCALAPPDATA%\XiangqiAI\logs`。复现问题后可提交 [Issue](https://github.com/diyishaoshuai/xiangqi-ai-assistant/issues)，附上版本号、Windows 版本、操作步骤、出错时间及对应日志片段。日志可能包含本机路径和棋局信息，公开前请检查、遮盖个人信息；程序本身不会上传日志或截图。
+
+**换电脑后为什么没有之前的学习数据？**
+
+日志和学习数据保存在每台电脑的当前 Windows 用户目录，不跟随 EXE 自动同步。需要迁移时，退出程序后额外复制 `recognition_templates.json` 到新电脑的同名数据目录；该文件不是运行必需品。
+
+**下载后提示未知发布者或安全警告怎么办？**
+
+本版未购买代码签名证书，可能出现未知发布者提示。请核对下载来源和 SHA-256；遇到杀毒软件明确报毒时，先停止运行并反馈检测结果，不要关闭系统防护或添加整个目录的排除项。
+
+**如何校验下载是否完整？**
+
+在 EXE 所在目录打开 PowerShell：
+
+```powershell
+Get-FileHash .\XiangqiAI.exe -Algorithm SHA256
+```
+
+将结果与**同一 Release** 的 `SHA256SUMS.txt` 对照。校验文件无需放在 EXE 旁，也无需随程序分发。
+
+**启动失败、无法识别或接管没有点击怎么办？**
+
+先确认系统为 x64、临时目录可写且有足够空间。识别时确保完整棋盘清晰可见；自动接管要求棋盘位于主屏幕、游戏窗口在前台、用户空闲，并正确选择执棋方和轮次。遮挡、切屏或盘面无法确认时会安全等待；按 `F1` 可停止。仍有问题时查看日志，不要同时运行多个接管副本。
+
+**不再使用时怎么删除？**
+
+退出所有副本后删除 EXE 即可移除程序。若连日志和学习数据也不要了，可另外删除软件专属的 `%LOCALAPPDATA%\XiangqiAI`；曾使用很早版本的用户可检查 `%USERPROFILE%\.xiangqi_ai`。不要删除整个 AppData 或临时目录。当前版本不创建卸载程序，也不需要运行旧版卸载器来删除它。
 
 ## 源码开发
 
-要求 Windows、Python 3.12（64 位）以及 Pikafish Windows 引擎和 NNUE 文件。
+要求 Windows、Python 3.11+（64 位）以及 Pikafish Windows 引擎和 NNUE 文件。本版使用 Python 3.11 和 PyInstaller 6.22.2 构建验证。
 
 ```powershell
 python -m venv .venv
@@ -122,7 +191,21 @@ python -m unittest discover -s . -p "test_*.py"
 pyinstaller --noconfirm --clean XiangqiAI.spec
 ```
 
+输出仅为 `dist/XiangqiAI.exe`；不需要再编译 Inno Setup 安装包。`dist/XiangqiAI/` 若还存在，是旧目录版历史产物，不属于新 EXE 的依赖。
+
+成品验证（不会操作真实棋盘或鼠标）：
+
+```powershell
+python build_support/verify_singlefile.py --exe dist/XiangqiAI.exe
+```
+
+验证会在 `build/singlefile-verification` 创建隔离的程序目录、用户数据和临时目录，运行内置功能自检、模型推理、接管模拟测试、日志轮转以及隐藏运行后的退出清理检查。提供 `--image` 可额外验证实际棋盘图片，报告保留在测试目录中。不要把开发自检参数当作日常启动参数使用。
+
 `PIKAFISH_DIR` 目录需包含 `Windows/pikafish-sse41-popcnt.exe` 和 `pikafish.nnue`。ONNX 棋盘定位与分类模型已包含在 `vision_models/`；其来源和许可证见 `vision_licenses/` 与 `THIRD_PARTY_NOTICES.md`。
+
+发布时同步更新 `diagnostics.py` 的版本、`build_support/version_info.txt`、README 和发布说明，重新构建后运行测试。Git 仓库仅提交源码、模型和文档；将 `dist/XiangqiAI.exe` 与它的 SHA-256 校验文件作为 GitHub Release 附件发布，不再生成安装包。历史安装维护说明见 [installer/README.md](installer/README.md)。
+
+本版验证包括 48 项单元测试（47 项通过、1 项因缺少原作者本机截图夹具而跳过）、21 项接管模拟检查及 108 项单 EXE 集成断言，覆盖识别、引擎、视角、日志、只读目录启动和退出清理。接管检查使用模拟 Win32 接口，不会点击真实棋盘；这些结果不等于已在所有游戏客户端或其他电脑上验证。详细范围见[发布说明](docs/releases/v2026.08.31-portable.md)。
 
 ## 注意
 

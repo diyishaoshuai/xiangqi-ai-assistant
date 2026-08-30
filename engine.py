@@ -29,27 +29,32 @@ class PikafishEngine:
         self.process: subprocess.Popen[str] | None = None
         self._write_lock = threading.Lock()
         self._search_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
         self.threads = threads
         self.hash_mb = hash_mb
 
     def start(self) -> None:
-        if self.process and self.process.poll() is None:
-            return
-        if not self.executable.exists():
-            raise EngineError(f"找不到引擎：{self.executable}")
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self.process = subprocess.Popen(
-            [str(self.executable)],
-            cwd=str(self.executable.parent),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=flags,
-        )
+        with self._lifecycle_lock:
+            if self._closed:
+                raise EngineError("引擎已关闭，不能重新启动")
+            if self.process and self.process.poll() is None:
+                return
+            if not self.executable.exists():
+                raise EngineError(f"找不到引擎：{self.executable}")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self.process = subprocess.Popen(
+                [str(self.executable)],
+                cwd=str(self.executable.parent),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=flags,
+            )
         self._send("uci")
         self._read_until("uciok")
         self._send(f"setoption name Threads value {self.threads}")
@@ -67,18 +72,26 @@ class PikafishEngine:
         self._read_until("readyok")
 
     def _send(self, command: str) -> None:
-        if not self.process or not self.process.stdin:
-            raise EngineError("引擎尚未启动")
         with self._write_lock:
-            self.process.stdin.write(command + "\n")
-            self.process.stdin.flush()
+            process = self.process
+            if not process or not process.stdin:
+                raise EngineError("引擎尚未启动")
+            try:
+                process.stdin.write(command + "\n")
+                process.stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise EngineError("引擎已退出") from exc
 
     def _read_until(self, token: str) -> list[str]:
-        if not self.process or not self.process.stdout:
+        process = self.process
+        if not process or not process.stdout:
             raise EngineError("引擎尚未启动")
         lines: list[str] = []
         while True:
-            line = self.process.stdout.readline()
+            try:
+                line = process.stdout.readline()
+            except (OSError, ValueError) as exc:
+                raise EngineError("引擎已退出") from exc
             if line == "":
                 raise EngineError("引擎意外退出")
             clean = line.strip()
@@ -112,13 +125,17 @@ class PikafishEngine:
                 position_command += " moves " + " ".join(move_history)
             self._send(position_command)
             self._send(f"go movetime {movetime_ms}")
-            if not self.process or not self.process.stdout:
+            process = self.process
+            if not process or not process.stdout:
                 raise EngineError("引擎尚未启动")
             latest: dict[int, AnalysisLine] = {}
             bestmove = ""
             output_tail: deque[str] = deque(maxlen=12)
             while True:
-                line = self.process.stdout.readline()
+                try:
+                    line = process.stdout.readline()
+                except (OSError, ValueError) as exc:
+                    raise EngineError("引擎已退出") from exc
                 if line == "":
                     details = "\n".join(output_tail)
                     suffix = f"\n\n引擎最后输出：\n{details}" if details else ""
@@ -175,14 +192,32 @@ class PikafishEngine:
                 pass
 
     def close(self) -> None:
-        process = self.process
-        self.process = None
-        if not process or process.poll() is not None:
+        with self._lifecycle_lock:
+            self._closed = True
+            process = self.process
+            self.process = None
+        if process is None:
             return
         try:
-            if process.stdin:
-                process.stdin.write("quit\n")
-                process.stdin.flush()
-            process.wait(timeout=1.5)
-        except Exception:
-            process.terminate()
+            if process.poll() is None:
+                try:
+                    with self._write_lock:
+                        if process.stdin:
+                            process.stdin.write("quit\n")
+                            process.stdin.flush()
+                    process.wait(timeout=1.5)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1.5)
+        finally:
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass

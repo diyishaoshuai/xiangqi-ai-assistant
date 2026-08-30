@@ -28,21 +28,19 @@ a = Analysis(
         (str(project / "THIRD_PARTY_NOTICES.md"), "."),
     ],
     hiddenimports=["cv2", "numpy", "onnxruntime"],
+    runtime_hooks=[str(project / "build_support" / "runtime_hook.py")],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    [],
-    exclude_binaries=True,
-    name="XiangqiAI",
-    console=False,
-)
-coll = COLLECT(
-    exe,
     a.binaries,
     a.datas,
+    [],
     name="XiangqiAI",
+    console=False,
+    upx=False,
+    version=str(project / "build_support" / "version_info.txt"),
 )
 
