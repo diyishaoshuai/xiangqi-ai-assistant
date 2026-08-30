@@ -18,7 +18,7 @@ FUNCTION_FLAGS = ["--engine-self-test", "--no-win-engine-self-test", "--anti-loo
                   "--anti-check-policy-self-test", "--outcome-guard-self-test", "--auto-analysis-self-test",
                   "--follow-best-self-test", "--follow-recovery-self-test", "--topmost-self-test",
                   "--orientation-self-test", "--direct-king-capture-self-test", "--help-self-test",
-                  "--automation-self-test"]
+                  "--automation-self-test", "--ui-self-test"]
 
 
 def sha256(path):
@@ -137,7 +137,7 @@ def main():
     def finish(process, name):
         out, err = process.communicate(timeout=90)
         (root / f"{name}.txt").write_bytes(out + err)
-        check(process.returncode == 0, f"{name}: exit=0")
+        check(process.returncode == 0, f"{name}: exit={process.returncode}")
         check(not err, f"{name}: no stderr errors")
 
     def clean_runtime(name):

@@ -95,6 +95,17 @@ def log_stress_probe():
     return 0
 
 
+def ui_probe():
+    import test_ui
+
+    stream = io.StringIO()
+    suite = unittest.defaultTestLoader.loadTestsFromModule(test_ui)
+    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
+    save_report("ui-probe.json", {"success": result.wasSuccessful(), "tests": result.testsRun,
+                                 "output": stream.getvalue()})
+    return 0 if result.wasSuccessful() else 72
+
+
 def help_probe(app):
     root = app.tk.Tk()
     root.withdraw()

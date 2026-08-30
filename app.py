@@ -46,6 +46,10 @@ from core import (
 from engine import EngineError, PikafishEngine
 from app_paths import resource_base as app_base
 from diagnostics import APP_VERSION, configure_logging, install_exception_logging
+from ui import (
+    ACCENT, BG, BLACK, BOARD, GRID, MUTED, PANEL, PANEL_2, RED, TEXT,
+    WorkspaceView, configure_styles, draw_chessboard,
+)
 from automation import (
     AutomationState,
     ConfirmationKind,
@@ -71,16 +75,6 @@ from automation import (
 
 
 APP_NAME = "本地象棋 AI 助手"
-BG = "#151716"
-PANEL = "#202421"
-PANEL_2 = "#292e2a"
-GRID = "#4c3927"
-BOARD = "#d6ab6d"
-RED = "#b92d2b"
-BLACK = "#171717"
-ACCENT = "#5dc98b"
-TEXT = "#edf1ed"
-MUTED = "#9ca69f"
 NO_WIN_TEST_FEN = "5a3/4ak3/4b4/9/2b6/5C3/9/9/5K3/9 w - - 0 1"
 DIRECT_CAPTURE_TEST_FEN = "9/4Rk3/9/9/9/P8/9/9/4A4/3AK4 w - - 0 1"
 LOOP_TEST_FEN = "4k4/4a4/4b4/9/9/9/4n4/8P/R1NK5/2B6 w - - 0 1"
@@ -217,10 +211,7 @@ class XiangqiApp:
 
         root.report_callback_exception = report_callback_exception
         self.root.title(APP_NAME)
-        self.root.geometry("1280x820")
-        self.root.minsize(1120, 740)
         self.root.configure(bg=BG)
-        self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
         menu = tk.Menu(self.root)
         help_menu = tk.Menu(menu, tearoff=False)
         help_menu.add_command(label="使用说明", command=lambda: self.show_help_document(False))
@@ -289,222 +280,21 @@ class XiangqiApp:
         self._build_ui()
         self.root.attributes("-topmost", True)
         self.draw_board()
-        self.root.after(100, self._poll_results)
-        self.root.after(50, self._poll_f1_hotkey)
+        self._results_poll_after_id = self.root.after(100, self._poll_results)
+        self._hotkey_poll_after_id = self.root.after(50, self._poll_f1_hotkey)
         self._schedule_auto_analysis(650)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_style(self) -> None:
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TFrame", background=BG)
-        style.configure("Panel.TFrame", background=PANEL)
-        style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure("Muted.TLabel", background=PANEL, foreground=MUTED)
-        style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Microsoft YaHei UI", 18, "bold"))
-        style.configure("TButton", padding=(10, 7), background=PANEL_2, foreground=TEXT)
-        style.map("TButton", background=[("active", "#384039")])
-        style.configure("Accent.TButton", padding=(12, 8), background=ACCENT, foreground="#0d1a11")
-        style.map("Accent.TButton", background=[("active", "#78d9a0")])
-        style.configure("TRadiobutton", background=PANEL, foreground=TEXT)
-        style.map("TRadiobutton", background=[("active", PANEL)])
-        style.configure("TCheckbutton", background=PANEL, foreground=TEXT)
-        style.map("TCheckbutton", background=[("active", PANEL)])
-        style.configure("Treeview", background="#161917", fieldbackground="#161917", foreground=TEXT, rowheight=28)
-        style.configure("Treeview.Heading", background=PANEL_2, foreground=TEXT)
-        style.map("Treeview", background=[("selected", "#335742")])
+        self.ui_scale = configure_styles(self.root)
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        width = min(round(1320 * self.ui_scale), screen_w - 64)
+        height = min(round(900 * self.ui_scale), screen_h - 96)
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(min(round(1000 * self.ui_scale), width), min(round(660 * self.ui_scale), height))
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self.root)
-        header.pack(fill="x", padx=18, pady=(14, 8))
-        ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
-        ttk.Label(
-            header,
-            textvariable=self.orientation_var,
-            foreground=MUTED,
-        ).pack(side="left", padx=18, pady=(6, 0))
-
-        body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, padx=18, pady=(0, 14))
-
-        left = ttk.Frame(body, style="Panel.TFrame")
-        left.pack(side="left", fill="y")
-        self.canvas = tk.Canvas(
-            left,
-            width=self.CANVAS_W,
-            height=self.CANVAS_H,
-            bg=BOARD,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        self.canvas.pack(padx=10, pady=10)
-        self.canvas.bind("<Button-1>", self._board_click)
-        self.canvas.bind("<Button-3>", self._board_erase)
-
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True, padx=(16, 0))
-        self._build_controls(right)
-
-    def _build_controls(self, parent: ttk.Frame) -> None:
-        setup = ttk.Frame(parent, style="Panel.TFrame")
-        setup.pack(fill="x", pady=(0, 10))
-        ttk.Label(setup, text="摆局工具", background=PANEL, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
-
-        tools = ttk.Frame(setup, style="Panel.TFrame")
-        tools.pack(fill="x", padx=10, pady=4)
-        ttk.Radiobutton(tools, text="移动棋子", variable=self.tool, value="move").pack(side="left", padx=3)
-        ttk.Radiobutton(tools, text="橡皮", variable=self.tool, value="erase").pack(side="left", padx=3)
-        ttk.Button(tools, text="撤销", command=self.undo).pack(side="right", padx=3)
-        ttk.Button(tools, text="重做", command=self.redo).pack(side="right", padx=3)
-
-        palette = ttk.Frame(setup, style="Panel.TFrame")
-        palette.pack(fill="x", padx=10, pady=4)
-        for piece in "KABNRCPkabnrcp":
-            color = RED if piece.isupper() else BLACK
-            rb = tk.Radiobutton(
-                palette,
-                text=PIECE_NAMES[piece],
-                variable=self.tool,
-                value=piece,
-                indicatoron=False,
-                width=3,
-                bg="#efe2c7",
-                fg=color,
-                activebackground="#fff0cf",
-                selectcolor="#f5cc7d",
-                relief="flat",
-                padx=2,
-                pady=5,
-            )
-            rb.pack(side="left", padx=2, pady=2)
-
-        quick = ttk.Frame(setup, style="Panel.TFrame")
-        quick.pack(fill="x", padx=10, pady=(4, 10))
-        ttk.Button(quick, text="标准开局", command=lambda: self.load_preset(START_FEN)).pack(side="left", padx=3)
-        ttk.Button(quick, text="双炮残局", command=lambda: self.load_preset(PUZZLE_FEN)).pack(side="left", padx=3)
-        ttk.Button(quick, text="清空", command=self.clear_board).pack(side="left", padx=3)
-        ttk.Button(quick, text="导入并识别", command=self.import_screenshot).pack(side="right", padx=3)
-        ttk.Button(quick, text="粘贴并识别", command=self.paste_screenshot).pack(side="right", padx=3)
-
-        fen_panel = ttk.Frame(parent, style="Panel.TFrame")
-        fen_panel.pack(fill="x", pady=(0, 10))
-        fen_top = ttk.Frame(fen_panel, style="Panel.TFrame")
-        fen_top.pack(fill="x", padx=12, pady=(9, 4))
-        ttk.Label(fen_top, text="FEN", background=PANEL, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        ttk.Radiobutton(fen_top, text="红走", variable=self.side_var, value="w", command=self._side_changed).pack(side="right", padx=4)
-        ttk.Radiobutton(fen_top, text="黑走", variable=self.side_var, value="b", command=self._side_changed).pack(side="right", padx=4)
-        player_row = ttk.Frame(fen_panel, style="Panel.TFrame")
-        player_row.pack(fill="x", padx=12, pady=(0, 3))
-        ttk.Label(player_row, text="我的棋", style="Muted.TLabel").pack(side="left")
-        ttk.Radiobutton(
-            player_row,
-            text="执红（红在下）",
-            variable=self.player_side_var,
-            value="w",
-            command=self._player_side_changed,
-        ).pack(side="left", padx=(10, 4))
-        ttk.Radiobutton(
-            player_row,
-            text="执黑（黑在下）",
-            variable=self.player_side_var,
-            value="b",
-            command=self._player_side_changed,
-        ).pack(side="left", padx=4)
-        fen_entry = tk.Entry(fen_panel, textvariable=self.fen_var, bg="#111411", fg=TEXT, insertbackground=TEXT, relief="flat")
-        fen_entry.pack(fill="x", padx=12, pady=4, ipady=6)
-        fen_actions = ttk.Frame(fen_panel, style="Panel.TFrame")
-        fen_actions.pack(fill="x", padx=10, pady=(2, 9))
-        ttk.Button(fen_actions, text="载入 FEN", command=self.load_fen).pack(side="left", padx=3)
-        ttk.Button(fen_actions, text="复制 FEN", command=self.copy_fen).pack(side="left", padx=3)
-
-        analysis = ttk.Frame(parent, style="Panel.TFrame")
-        analysis.pack(fill="both", expand=True)
-        analysis_top = ttk.Frame(analysis, style="Panel.TFrame")
-        analysis_top.pack(fill="x", padx=12, pady=(10, 6))
-        ttk.Label(analysis_top, text="引擎分析", background=PANEL, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        ttk.Label(analysis_top, text="思考", style="Muted.TLabel").pack(side="left", padx=(18, 4))
-        ttk.Combobox(
-            analysis_top,
-            textvariable=self.time_var,
-            values=(500, 1000, 3000, 5000, 10000, 30000),
-            width=7,
-            state="readonly",
-        ).pack(side="left")
-        ttk.Label(analysis_top, text="毫秒", style="Muted.TLabel").pack(side="left", padx=(3, 10))
-        ttk.Label(analysis_top, text="候选", style="Muted.TLabel").pack(side="left", padx=(2, 4))
-        ttk.Spinbox(analysis_top, from_=1, to=5, textvariable=self.multipv_var, width=4).pack(side="left")
-        ttk.Button(analysis_top, text="停止", command=self.stop_analysis).pack(side="right", padx=3)
-        ttk.Button(analysis_top, text="开始分析", style="Accent.TButton", command=self.start_analysis).pack(side="right", padx=3)
-
-        analysis_options = ttk.Frame(analysis, style="Panel.TFrame")
-        analysis_options.pack(fill="x", padx=12, pady=(0, 5))
-        ttk.Checkbutton(
-            analysis_options,
-            text="自动分析",
-            variable=self.auto_analysis_var,
-            command=self._auto_analysis_toggled,
-        ).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(
-            analysis_options,
-            text="跟随首选着（只录对方走子）",
-            variable=self.follow_best_var,
-            command=self._follow_best_toggled,
-        ).pack(side="left")
-        ttk.Button(
-            analysis_options,
-            text="打开日志",
-            command=self.open_log,
-        ).pack(side="right")
-        ttk.Checkbutton(
-            analysis_options,
-            text="窗口置顶",
-            variable=self.always_on_top_var,
-            command=self._topmost_toggled,
-        ).pack(side="right", padx=(0, 12))
-
-        mouse_row = ttk.Frame(analysis, style="Panel.TFrame")
-        mouse_row.pack(fill="x", padx=12, pady=(0, 5))
-        self.mouse_auto_button = ttk.Button(
-            mouse_row,
-            text="自动接管鼠标",
-            command=self._toggle_mouse_autoplay,
-        )
-        self.mouse_auto_button.pack(side="left")
-        ttk.Label(
-            mouse_row,
-            text="自动识别对手走子并代下首选着；F1 全局启停",
-            style="Muted.TLabel",
-        ).pack(side="left", padx=(10, 0))
-
-        columns = ("rank", "score", "move", "depth")
-        self.tree = ttk.Treeview(analysis, columns=columns, show="headings", height=6)
-        self.tree.heading("rank", text="#")
-        self.tree.heading("score", text="判断")
-        self.tree.heading("move", text="首选着")
-        self.tree.heading("depth", text="深度")
-        self.tree.column("rank", width=34, anchor="center", stretch=False)
-        self.tree.column("score", width=90, anchor="center", stretch=False)
-        self.tree.column("move", width=210, anchor="w")
-        self.tree.column("depth", width=52, anchor="center", stretch=False)
-        self.tree.pack(fill="x", padx=12, pady=4)
-        self.tree.bind("<<TreeviewSelect>>", self._analysis_selected)
-        self.tree.bind("<Double-1>", self.apply_selected_move)
-
-        ttk.Label(analysis, text="主要变化（双击候选着可落子）", style="Muted.TLabel").pack(anchor="w", padx=12, pady=(7, 3))
-        self.pv_text = tk.Text(
-            analysis,
-            height=6,
-            wrap="word",
-            bg="#111411",
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            padx=9,
-            pady=7,
-        )
-        self.pv_text.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        self.pv_text.configure(state="disabled")
-        ttk.Label(analysis, textvariable=self.status_var, style="Muted.TLabel").pack(anchor="w", padx=12, pady=(0, 10))
+        self.ui = WorkspaceView(self)
 
     def _record_undo(self) -> None:
         self.undo_stack.append((dict(self.board), self.side))
@@ -554,6 +344,10 @@ class XiangqiApp:
         self.fen_var.set(make_fen(self.board, self.side))
         self.selected_square = None
         self.best_arrow = None
+        if self.board != self.analysis_board or self.side != self.analysis_side:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self._set_pv_text("")
         self.draw_board()
         if reset_repetition or reset_history:
             signature = make_fen(self.board, self.side)
@@ -625,9 +419,12 @@ class XiangqiApp:
         window = tk.Toplevel(self.root)
         window.title("第三方说明与许可证" if licenses else "使用说明")
         window.geometry("880x640")
+        window.configure(bg=BG)
         scrollbar = ttk.Scrollbar(window)
         scrollbar.pack(side="right", fill="y")
-        document = tk.Text(window, wrap="word", padx=16, pady=12, yscrollcommand=scrollbar.set)
+        document = tk.Text(window, wrap="word", padx=24, pady=20, yscrollcommand=scrollbar.set,
+                           bg=PANEL, fg=TEXT, relief="flat", font=("Microsoft YaHei UI", -14),
+                           spacing1=3, spacing3=4, selectbackground="#D5E9DC")
         document.pack(fill="both", expand=True)
         scrollbar.config(command=document.yview)
         document.insert("1.0", content)
@@ -789,69 +586,9 @@ class XiangqiApp:
         )
 
     def draw_board(self) -> None:
-        c = self.canvas
-        c.delete("all")
-        c.create_rectangle(0, 0, self.CANVAS_W, self.CANVAS_H, fill=BOARD, outline="")
-        if self.background_image is not None and ImageTk is not None:
-            grid_w, grid_h = self.CELL * 8, self.CELL * 9
-            rendered = self.background_image.resize((grid_w, grid_h))
-            if self.assisted_side == "b":
-                rendered = rendered.rotate(180)
-            rendered = ImageEnhance.Brightness(rendered).enhance(0.56)
-            self.background_tk = ImageTk.PhotoImage(rendered)
-            c.create_image(self.X0, self.Y0, image=self.background_tk, anchor="nw")
-
-        for x in range(9):
-            px = self.X0 + x * self.CELL
-            c.create_line(px, self.Y0, px, self.Y0 + 4 * self.CELL, fill=GRID, width=2)
-            c.create_line(px, self.Y0 + 5 * self.CELL, px, self.Y0 + 9 * self.CELL, fill=GRID, width=2)
-            if x in {0, 8}:
-                c.create_line(px, self.Y0 + 4 * self.CELL, px, self.Y0 + 5 * self.CELL, fill=GRID, width=2)
-        for row in range(10):
-            py = self.Y0 + row * self.CELL
-            c.create_line(self.X0, py, self.X0 + 8 * self.CELL, py, fill=GRID, width=2)
-
-        for top in (0, 7):
-            y1 = self.Y0 + top * self.CELL
-            y3 = y1 + 2 * self.CELL
-            x1 = self.X0 + 3 * self.CELL
-            x3 = self.X0 + 5 * self.CELL
-            c.create_line(x1, y1, x3, y3, fill=GRID, width=2)
-            c.create_line(x3, y1, x1, y3, fill=GRID, width=2)
-
-        river_y = self.Y0 + 4.5 * self.CELL
-        left_river, right_river = (
-            ("汉 界", "楚 河") if self.assisted_side == "b" else ("楚 河", "汉 界")
-        )
-        c.create_text(self.X0 + 2 * self.CELL, river_y, text=left_river, fill=GRID, font=("SimSun", 22, "bold"))
-        c.create_text(self.X0 + 6 * self.CELL, river_y, text=right_river, fill=GRID, font=("SimSun", 22, "bold"))
-
-        displayed_files = reversed(FILES) if self.assisted_side == "b" else FILES
-        for display_x, file_name in enumerate(displayed_files):
-            px = self.X0 + display_x * self.CELL
-            c.create_text(px, self.Y0 - 20, text=file_name, fill="#725d43", font=("Consolas", 10))
-            c.create_text(px, self.Y0 + 9 * self.CELL + 20, text=file_name, fill="#725d43", font=("Consolas", 10))
-        for y in range(10):
-            _, py = self._canvas_point((0, y))
-            c.create_text(self.X0 - 25, py, text=str(y), fill="#725d43", font=("Consolas", 10))
-
-        if self.best_arrow:
-            start, end = self.best_arrow
-            sx, sy = self._canvas_point(start)
-            ex, ey = self._canvas_point(end)
-            c.create_line(sx, sy, ex, ey, fill=ACCENT, width=9, arrow=tk.LAST, arrowshape=(18, 22, 8), stipple="gray50")
-
-        if self.selected_square:
-            sx, sy = self._canvas_point(self.selected_square)
-            c.create_oval(sx - 29, sy - 29, sx + 29, sy + 29, outline=ACCENT, width=4)
-
-        for square, piece in self.board.items():
-            x, y = self._canvas_point(square)
-            fill = "#f4e4c5" if piece.isupper() else "#ddd8cb"
-            outline = RED if piece.isupper() else BLACK
-            c.create_oval(x - 25, y - 25, x + 25, y + 25, fill=fill, outline=outline, width=3)
-            c.create_oval(x - 20, y - 20, x + 20, y + 20, outline=outline, width=1)
-            c.create_text(x, y, text=PIECE_NAMES[piece], fill=outline, font=("SimSun", 25, "bold"))
+        draw_chessboard(self)
+        if hasattr(self, "ui"):
+            self.ui.update_analysis()
 
     def _prepare_screenshot(self, image) -> None:
         if Image is None:
@@ -1171,6 +908,7 @@ class XiangqiApp:
             self.tree.delete(item)
         self._set_pv_text("")
         self.analysis_running = True
+        self.ui.update_analysis()
         thread = threading.Thread(
             target=self._analysis_worker,
             args=(
@@ -1342,7 +1080,8 @@ class XiangqiApp:
                     self._finish_mouse_autoplay(session_id, level, title, detail)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_results)
+        self.ui.update_analysis()
+        self._results_poll_after_id = self.root.after(100, self._poll_results)
 
     def _show_analysis(
         self,
@@ -1366,6 +1105,7 @@ class XiangqiApp:
                 "",
                 "end",
                 iid=str(index),
+                tags=("alternate",) if index % 2 else (),
                 values=(
                     line.multipv,
                     score_text(line, self.analysis_side),
@@ -1407,6 +1147,7 @@ class XiangqiApp:
                 self.status_var.set(f"完成：{top}；双击候选着可直接落子")
         else:
             self.status_var.set(f"分析结束：{bestmove or '无合法着法'}")
+            self.ui.update_analysis()
 
     def _handle_no_win(self, line: AnalysisLine, score: str) -> bool:
         # During manual two-sided analysis the side to move can temporarily be
@@ -1460,6 +1201,11 @@ class XiangqiApp:
 
     def _select_analysis_index(self, index: int) -> None:
         if not (0 <= index < len(self.analysis_lines)):
+            return
+        if self.board != self.analysis_board or self.side != self.analysis_side:
+            self.best_arrow = None
+            self._set_pv_text("局面已变化，请等待新的分析结果。")
+            self.draw_board()
             return
         line = self.analysis_lines[index]
         try:
@@ -1560,7 +1306,7 @@ class XiangqiApp:
             self.logger.info("global F1 takeover toggle")
             self._toggle_mouse_autoplay()
         try:
-            self.root.after(50, self._poll_f1_hotkey)
+            self._hotkey_poll_after_id = self.root.after(50, self._poll_f1_hotkey)
         except tk.TclError:
             pass
 
@@ -2471,7 +2217,7 @@ class XiangqiApp:
         restart = self.mouse_auto_pending_start and not self.closing
         self.mouse_auto_pending_start = False
         if self.mouse_auto_button is not None:
-            self.mouse_auto_button.configure(text="自动接管鼠标", state="normal")
+            self.mouse_auto_button.configure(text="自动接管鼠标   F1", state="normal")
         if not restart:
             try:
                 self.root.deiconify()
@@ -2495,6 +2241,9 @@ class XiangqiApp:
         self.mouse_auto_pending_start = False
         self.mouse_auto_stop_event.set()
         self._invalidate_analysis()
+        for timer in (self._results_poll_after_id, self._hotkey_poll_after_id):
+            self.root.after_cancel(timer)
+        self.ui.close()
         try:
             self.engine.close()
         finally:
@@ -2804,11 +2553,15 @@ def follow_best_self_test() -> int:
         ):
             return 11
         line = app._current_analysis_line()
-        if len(line.pv) < 2:
-            return 12
         expected_after_best = apply_move(initial_board, line.best_move)
         opponent_side = "b" if initial_side == "w" else "w"
-        opponent_square, target = parse_move(line.pv[1])
+        # A valid short search can end on a bound with a one-move PV. The
+        # follow UI only needs the user's reply, not a predicted second ply.
+        # Ask for an actual legal reply instead of assuming PV length >= 2.
+        _reply_lines, reply_move = app.engine.analyse(
+            make_fen(expected_after_best, opponent_side), 350, 1
+        )
+        opponent_square, target = parse_move(reply_move)
         if piece_side(expected_after_best.get(opponent_square, "P")) != opponent_side:
             return 12
         if not app._auto_follow_recommendation(opponent_square):
@@ -2825,7 +2578,7 @@ def follow_best_self_test() -> int:
         if (
             app.side != initial_side
             or app.follow_move_pending
-            or app.engine_move_history != [line.best_move, line.pv[1]]
+            or app.engine_move_history != [line.best_move, reply_move]
         ):
             return 14
         if not wait_for(
@@ -3004,6 +2757,11 @@ def direct_king_capture_self_test() -> int:
 
 
 if __name__ == "__main__":
+    if "--ui-self-test" in sys.argv:
+        from build_checks import ui_probe
+
+        enable_dpi_awareness()
+        raise SystemExit(ui_probe())
     if "--runtime-probe" in sys.argv:
         from build_checks import runtime_probe
 
