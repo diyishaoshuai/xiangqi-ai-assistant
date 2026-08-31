@@ -12,7 +12,14 @@ class BaseONNX(ABC):
             model_path (str): ONNX模型路径
             input_size (tuple): 模型输入尺寸 (width, height)
         """
-        self.session = onnxruntime.InferenceSession(model_path)
+        # Local desktop integration: leave CPU time for the game, engine and
+        # emergency-key/UI threads instead of two default full-core pools.
+        options = onnxruntime.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        self.session = onnxruntime.InferenceSession(model_path, sess_options=options)
         self.input_name = self.session.get_inputs()[0].name
         self.input_size = input_size
 
@@ -85,4 +92,3 @@ class BaseONNX(ABC):
         for image in images:
             if not isinstance(image, cv2.UMat) and not isinstance(image, str) and not isinstance(image, np.ndarray):
                 raise ValueError("The images must be a list of cv2.UMat or str or np.ndarray.")
- 

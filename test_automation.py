@@ -1,4 +1,7 @@
 import unittest
+from dataclasses import replace
+
+from recognition import BoardGeometry
 
 from automation import (
     ConfirmationKind,
@@ -193,32 +196,42 @@ class AutomationTests(unittest.TestCase):
 
     def test_stop_between_clicks_prevents_second_click(self):
         user32 = FakeUser32([True])
-        calls = 0
-
-        def cancelled():
-            nonlocal calls
-            calls += 1
-            return calls >= 3
 
         with self.assertRaises(InterruptedError):
             click_screen_move(
                 (10, 20),
                 (30, 40),
-                cancelled,
+                lambda: len(user32.mouse_events) >= 2,
                 pause_seconds=0.2,
                 user32=user32,
                 sleep=lambda _seconds: None,
             )
         self.assertEqual(len(user32.mouse_events), 2)
 
+    def test_stop_after_cursor_position_before_press_sends_no_click(self):
+        user32 = FakeUser32([True])
+        stopped = False
+
+        def pause(_seconds):
+            nonlocal stopped
+            stopped = True
+
+        with self.assertRaises(InterruptedError):
+            click_screen_move((10, 20), (30, 40), lambda: stopped,
+                              user32=user32, sleep=pause)
+        self.assertEqual(user32.mouse_events, [])
+
+    def test_stability_also_requires_non_jumping_click_coordinates(self):
+        board = {(4, 0): "K", (4, 9): "k"}
+        geometry = BoardGeometry((1, 0, 0, 0, 1, 0, 0, 0, 1), False, .9, (1000, 800))
+        moved = replace(geometry, inverse_matrix=(1, 0, 100, 0, 1, 0, 0, 0, 1))
+        tracker = StableBoardTracker(2)
+        self.assertFalse(tracker.observe(board, geometry=geometry))
+        self.assertFalse(tracker.observe(board, geometry=moved))
+        self.assertTrue(tracker.observe(board, geometry=moved))
+
     def test_window_change_cancels_transaction_after_first_click(self):
         user32 = FakeUser32([True])
-        guard_calls = 0
-
-        def guard():
-            nonlocal guard_calls
-            guard_calls += 1
-            return guard_calls == 1
 
         with self.assertRaises(UserInterferenceError) as raised:
             click_screen_move(
@@ -226,7 +239,7 @@ class AutomationTests(unittest.TestCase):
                 (30, 40),
                 lambda: False,
                 pause_seconds=0.2,
-                guard=guard,
+                guard=lambda: not user32.mouse_events,
                 user32=user32,
                 sleep=lambda _seconds: None,
             )

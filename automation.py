@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -71,23 +72,39 @@ class StableBoardTracker:
     required_frames: int
     previous: dict[tuple[int, int], str] | None = None
     count: int = 0
+    previous_geometry: object = None
 
     def observe(
         self,
         board: dict[tuple[int, int], str],
         *,
         accepted: bool = True,
+        geometry=None,
     ) -> bool:
         if not accepted:
             self.reset()
             return False
-        self.count = self.count + 1 if board == self.previous else 1
+        same_geometry = True
+        if geometry is not None and hasattr(geometry, "point_for_square") and self.previous_geometry is not None:
+            previous = self.previous_geometry
+            squares = ((0, 0), (8, 0), (0, 9), (8, 9))
+            tolerance = max(2.0, math.dist(geometry.point_for_square((0, 0)),
+                                          geometry.point_for_square((1, 0))) * 0.12)
+            same_geometry = (
+                geometry.image_size == previous.image_size
+                and geometry.rotated == previous.rotated
+                and all(math.dist(geometry.point_for_square(square), previous.point_for_square(square)) <= tolerance
+                        for square in squares)
+            )
+        self.count = self.count + 1 if board == self.previous and same_geometry else 1
         self.previous = dict(board)
+        self.previous_geometry = geometry if hasattr(geometry, "point_for_square") else None
         return self.count >= self.required_frames
 
     def reset(self) -> None:
         self.previous = None
         self.count = 0
+        self.previous_geometry = None
 
 
 @dataclass
@@ -286,7 +303,9 @@ def user_input_is_idle(
 def foreground_window() -> int:
     if not hasattr(ctypes, "windll"):
         return 0
-    return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    api = ctypes.windll.user32
+    api.GetForegroundWindow.restype = ctypes.c_void_p
+    return int(api.GetForegroundWindow() or 0)
 
 
 def window_at_point(point: tuple[float, float]) -> int:
@@ -294,7 +313,9 @@ def window_at_point(point: tuple[float, float]) -> int:
         return 0
     user32 = ctypes.windll.user32
     user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.WindowFromPoint.argtypes = [_Point]
     user32.GetAncestor.restype = ctypes.c_void_p
+    user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     child = user32.WindowFromPoint(_Point(round(point[0]), round(point[1])))
     if not child:
         return 0
@@ -341,6 +362,7 @@ def click_screen_move(
     guard: Callable[[], bool] | None = None,
     move_retries: int = 3,
     cursor_tolerance: int = 3,
+    settle_seconds: float = 0.06,
     user32=None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> ClickResult:
@@ -369,10 +391,17 @@ def click_screen_move(
             sleep=sleep,
         )
         cursor_attempts += attempts
-        sleep(0.06)
+        sleep(settle_seconds)
+        # Cancellation may arrive after SetCursorPos, before the button press.
+        if cancelled():
+            raise InterruptedError("自动接管已停止")
+        if guard is not None and not guard():
+            raise UserInterferenceError("游戏窗口已切换", first_click_sent=first_click_sent)
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        sleep(0.035)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        try:
+            sleep(0.035)
+        finally:
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         first_click_sent = True
 
     try:

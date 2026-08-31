@@ -5,6 +5,7 @@ import logging
 import re
 import subprocess
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -107,9 +108,15 @@ class PikafishEngine:
         *,
         history_fen: str | None = None,
         moves: list[str] | tuple[str, ...] | None = None,
+        cancelled=None,
     ) -> tuple[list[AnalysisLine], str]:
         with self._search_lock:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("搜索已取消")
             self.start()
+            if cancelled is not None and cancelled():
+                raise InterruptedError("搜索已取消")
+            started = time.monotonic()
             move_history = list(moves or ())
             LOGGER.info(
                 "analysis start fen=%s history_fen=%s moves=%s movetime_ms=%s multipv=%s",
@@ -124,14 +131,25 @@ class PikafishEngine:
             if move_history:
                 position_command += " moves " + " ".join(move_history)
             self._send(position_command)
+            if cancelled is not None and cancelled():
+                raise InterruptedError("搜索已取消")
             self._send(f"go movetime {movetime_ms}")
+            # Cover stop arriving immediately before/while sending 'go'. Drain
+            # that search's bestmove before releasing the shared engine lock.
+            stop_sent = cancelled is not None and cancelled()
+            if stop_sent:
+                self._send("stop")
             process = self.process
             if not process or not process.stdout:
                 raise EngineError("引擎尚未启动")
             latest: dict[int, AnalysisLine] = {}
             bestmove = ""
             output_tail: deque[str] = deque(maxlen=12)
+            last_depth_log = -float("inf")
             while True:
+                if not stop_sent and cancelled is not None and cancelled():
+                    self._send("stop")
+                    stop_sent = True
                 try:
                     line = process.stdout.readline()
                 except (OSError, ValueError) as exc:
@@ -143,7 +161,13 @@ class PikafishEngine:
                 clean = line.strip()
                 if clean:
                     output_tail.append(clean)
-                    LOGGER.debug("engine << %s", clean)
+                    now = time.monotonic()
+                    # Parse every PV, but don't open/flush a file thousands of
+                    # times during one short search. Keep full error tails above.
+                    if not clean.startswith("info depth ") or now - last_depth_log >= .25:
+                        LOGGER.debug("engine << %s", clean)
+                        if clean.startswith("info depth "):
+                            last_depth_log = now
                 match = INFO_RE.search(clean)
                 if match:
                     wdl_match = WDL_RE.search(clean)
@@ -169,16 +193,20 @@ class PikafishEngine:
                     parts = clean.split()
                     bestmove = parts[1] if len(parts) > 1 else ""
                     break
+            if cancelled is not None and cancelled():
+                raise InterruptedError("搜索已取消")
             result = [latest[key] for key in sorted(latest)]
             if result:
                 top = result[0]
                 LOGGER.info(
-                    "analysis done bestmove=%s depth=%s score=%s:%s wdl=%s",
+                    "analysis done bestmove=%s depth=%s score=%s:%s wdl=%s elapsed_ms=%.1f budget_ms=%s",
                     bestmove,
                     top.depth,
                     top.score_type,
                     top.score,
                     top.wdl,
+                    (time.monotonic() - started) * 1000,
+                    movetime_ms,
                 )
             else:
                 LOGGER.info("analysis done bestmove=%s no analysis lines", bestmove)

@@ -77,14 +77,67 @@ def automation_probe():
     import test_automation
     import test_app_automation
     import test_app_logic
+    import test_hotkey
+    import test_autoplay_speed
+    import test_search_pipeline
+    import test_player_side
 
     stream = io.StringIO()
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromModule(module)
-                              for module in (test_automation, test_app_automation, test_app_logic))
+                              for module in (test_automation, test_app_automation, test_app_logic, test_hotkey, test_autoplay_speed, test_search_pipeline, test_player_side))
     result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
     save_report("automation-probe.json", {"success": result.wasSuccessful(),
                 "tests": result.testsRun, "output": stream.getvalue()})
     return 0 if result.wasSuccessful() else 71
+
+
+def vision_performance_probe(module):
+    """Exercise models on a worker with the real hidden Tk UI, never desktop input."""
+    import threading
+    import time
+    from PIL import Image
+    from unittest.mock import patch
+
+    root = module.tk.Tk()
+    root.withdraw()
+    app = module.XiangqiApp(root)
+    app.auto_analysis_var.set(False)
+    app._invalidate_analysis()
+    report = {"version": APP_VERSION, "frozen": bool(getattr(sys, "frozen", False)), "samples": []}
+    images = sys.argv[sys.argv.index("--probe-images") + 1:]
+
+    def run():
+        try:
+            for filename in images:
+                image = Image.open(filename).convert("RGB")
+                for frame in range(3):
+                    started = time.perf_counter()
+                    _, detections = app.recognizer.recognize(image,
+                        geometry_hint=app.recognizer.last_geometry if frame else None,
+                        minimum_geometry_confidence=.1, cancelled=lambda: False)
+                    report["samples"].append({"image": os.path.basename(filename), "frame": frame,
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                        "stages": dict(app.recognizer.neural.last_timings), "pieces": len(detections)})
+            report["success"] = True
+        except Exception:
+            report["success"] = False
+            report["error"] = traceback.format_exc()
+
+    worker = threading.Thread(target=run, daemon=True)
+    try:
+        # Test must neither acquire F1 nor poll real keyboard state.
+        with patch.object(module, "f1_pressed", return_value=False):
+            worker.start()
+            deadline = time.monotonic() + 60
+            while worker.is_alive() and time.monotonic() < deadline:
+                root.update()
+                worker.join(.01)
+        if worker.is_alive():
+            report.update(success=False, error="performance probe timed out")
+    finally:
+        app._on_close()
+        save_report("vision-performance.json", report)
+    return 0 if report.get("success") else 72
 
 
 def log_stress_probe():

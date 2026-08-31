@@ -103,6 +103,39 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(self.app.follow_best_var.get())
         self.assertTrue(self.app.always_on_top_var.get())
 
+    def test_approved_workbench_has_author_and_defaults_to_auto_player(self):
+        self.assertEqual(self.app.ui.author_label.cget("text"), "作者：第一少帅")
+        self.assertTrue(self.app.auto_player_side_var.get())
+        self.app._accept_detected_player_side("b")
+        self.assertEqual(self.app.ui.bottom_player_var.get(), "我方 · 黑方")
+        self.assertEqual(self.app.ui.top_player_var.get(), "对方 · 红方")
+        self.assertEqual(self.app.side, "w")
+        self.app.player_side_var.set("w")
+        self.app._player_side_changed()
+        self.assertFalse(self.app.auto_player_side_var.get())
+
+    def test_settings_reuse_window_and_do_not_change_engine_budget(self):
+        self.app.time_var.set(500)
+        self.app.ui.show_settings()
+        window = self.app.ui.settings_window
+        self.app.ui.show_settings()
+        self.assertIs(self.app.ui.settings_window, window)
+        self.app.ui.motion_var.set(False)
+        self.app.ui.coordinates_var.set(False)
+        self.app.draw_board()
+        self.assertEqual(self.app.canvas.find_withtag("coordinate"), ())
+        self.assertEqual(self.app.time_var.get(), 500)
+        window.destroy()
+
+    def test_arrow_visibility_setting_does_not_change_selected_move(self):
+        line = self.show_line()
+        self.assertTrue(self.app.canvas.find_withtag("recommendation"))
+        self.app.ui.arrow_var.set(False)
+        self.app.draw_board()
+        self.assertFalse(self.app.canvas.find_withtag("recommendation"))
+        self.assertEqual(self.app._current_analysis_line(), line)
+        self.assertFalse(self.app.ui.apply_button.instate(["disabled"]))
+
     def test_time_display_converts_seconds_to_existing_engine_milliseconds(self):
         ui = self.app.ui
         ui.time_label.set("0.5 秒")
@@ -198,6 +231,43 @@ class WorkspaceTests(unittest.TestCase):
                 self.root.after_cancel(app._hotkey_poll_after_id)
                 app._poll_f1_hotkey()
         toggle.assert_called_once()
+
+    def test_f1_restores_real_tk_window_while_capture_is_still_blocked(self):
+        import threading
+        from automation import AutomationState
+
+        app = self.app
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked_worker(session_id, *_args):
+            entered.set()
+            release.wait(3)
+            app.result_queue.put(("mouse_done", (session_id, "silent", "stopped", "stopped")))
+
+        app.mouse_auto_consent_confirmed = True
+        with patch.object(app, "_mouse_autoplay_worker", side_effect=blocked_worker):
+            app._start_mouse_autoplay()
+            worker = app.mouse_auto_thread
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.root.state(), "withdrawn")
+                app._on_global_f1()
+                self.root.after_cancel(app._hotkey_poll_after_id)
+                app._poll_f1_hotkey()
+                self.assertEqual(self.root.state(), "normal")
+                self.assertTrue(worker.is_alive())
+                self.assertTrue(app.mouse_auto_stop_event.is_set())
+                self.assertEqual(app.mouse_auto_state, AutomationState.STOPPING)
+                app._toggle_mouse_autoplay()
+                self.assertFalse(app.mouse_auto_pending_start)
+            finally:
+                release.set()
+                worker.join(timeout=1)
+                self.root.after_cancel(app._results_poll_after_id)
+                app._poll_results()
+                self.root.withdraw()
+        self.assertFalse(app.mouse_auto_running)
+        self.assertEqual(app.mouse_auto_state, AutomationState.IDLE)
 
     def test_background_cache_refreshes_with_resize_flip_and_visibility(self):
         from PIL import Image

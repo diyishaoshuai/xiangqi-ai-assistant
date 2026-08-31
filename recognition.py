@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,10 @@ except ImportError:  # The legacy recognizer remains available as a safe fallbac
 
 from core import FILES
 from app_paths import resource_base as _runtime_base, user_data_dir
+
+
+class TransientBoardFrame(RuntimeError):
+    """A locked board is visible, but this animation/occlusion frame is unusable."""
 
 
 # Ratios of the 9x10 intersection rectangle inside this game's 16:9 screenshot.
@@ -296,6 +301,10 @@ class NeuralBoardRecognizer:
         self.last_layout = ""
         self.last_keypoint_scores: list[float] = []
         self.last_geometry: BoardGeometry | None = None
+        self.last_search_bbox = None
+        self.last_image_size = None
+        self.tracking_failures = 0
+        self.last_timings = {}
 
     @staticmethod
     def _validate_keypoints(image_rgb, keypoints) -> None:
@@ -390,23 +399,82 @@ class NeuralBoardRecognizer:
         score -= sum(max(0, labels.count(piece) - limit) for piece, limit in limits.items()) * 0.10
         return score
 
-    def recognize(self, image: Image.Image) -> tuple[Image.Image, list[Detection]]:
+    @staticmethod
+    def _hint_bbox(geometry: BoardGeometry | None, image_size) -> list[int] | None:
+        if geometry is None or geometry.image_size != image_size:
+            return None
+        corners = [geometry.point_for_square(square) for square in ((0, 0), (8, 0), (0, 9), (8, 9))]
+        left, right = min(p[0] for p in corners), max(p[0] for p in corners)
+        top, bottom = min(p[1] for p in corners), max(p[1] for p in corners)
+        pad_x, pad_y = (right - left) * .14, (bottom - top) * .14
+        width, height = image_size
+        return [max(0, int(left - pad_x)), max(0, int(top - pad_y)),
+                min(width, int(right + pad_x)), min(height, int(bottom + pad_y))]
+
+    def recognize(self, image: Image.Image, *, geometry_hint=None,
+                  minimum_geometry_confidence: float = 0.0,
+                  cancelled=None) -> tuple[Image.Image, list[Detection]]:
+        def check_cancelled():
+            if cancelled is not None and cancelled():
+                raise InterruptedError("用户已停止自动接管")
+
+        check_cancelled()
+        self.last_timings = {"pose_ms": 0.0, "classifier_ms": 0.0, "regions": 0}
+
+        def predict(model, stage, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return model.pred(*args, **kwargs)
+            finally:
+                self.last_timings[stage + "_ms"] += round((time.perf_counter() - started) * 1000, 1)
+
         image_rgb = np.asarray(image.convert("RGB"))
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         frame_height, frame_width = image_bgr.shape[:2]
         best = None
         errors: list[str] = []
-        for bbox in self._candidate_bboxes(frame_height, frame_width):
+        bboxes = self._candidate_bboxes(frame_height, frame_width)
+        hint_bbox = self._hint_bbox(geometry_hint, image.size)
+        if hint_bbox is not None:
+            bboxes.insert(0, hint_bbox)
+            # Repeat the region that actually worked, not only a newly guessed
+            # padded crop. Coordinates still come from a fresh pose inference.
+            previous_bbox = getattr(self, "last_search_bbox", None)
+            if previous_bbox is not None and getattr(self, "last_image_size", None) == image.size:
+                bboxes.insert(0, list(previous_bbox))
+        bboxes = [list(item) for item in dict.fromkeys(tuple(bbox) for bbox in bboxes)]
+        for bbox in bboxes:
             try:
-                keypoints, keypoint_scores = self.pose.pred(
+                check_cancelled()
+                self.last_timings["regions"] += 1
+                keypoints, keypoint_scores = predict(self.pose, "pose",
                     image=image_bgr,
                     bbox=bbox,
                 )
+                check_cancelled()
                 self._validate_keypoints(image_rgb, keypoints)
+                # Do not select a high-classification candidate whose coordinates
+                # automation will reject, when another region can locate it safely.
+                if min(keypoint_scores, default=0.0) < minimum_geometry_confidence:
+                    raise RuntimeError(f"棋盘定位置信度过低（{min(keypoint_scores):.2f}）")
                 transformed, _, _ = extract_chessboard(image_rgb, keypoints)
-                _, rows, confidences, layout = self.classifier.pred(
+                _, rows, confidences, layout = predict(self.classifier, "classifier",
                     transformed, is_rgb=True
                 )
+                check_cancelled()
+                if minimum_geometry_confidence > 0.0:
+                    unknown = sum(label == "x" or (label == "." and float(confidences[r][c]) < .45)
+                                  for r, row in enumerate(rows) for c, label in enumerate(row))
+                    if unknown:
+                        # A temporary animation at the SAME freshly located
+                        # board cannot be fixed by classifying this stale image
+                        # four more ways. Try a NEW frame first. Periodic full
+                        # recovery remains available for a persistently bad ROI.
+                        if hint_bbox is not None and self._pose_matches_hint(keypoints, geometry_hint):
+                            self.tracking_failures = getattr(self, "tracking_failures", 0) + 1
+                            if self.tracking_failures < 3:
+                                raise TransientBoardFrame(f"棋盘动画/遮挡，本帧有 {unknown} 个低置信度格子；等待新帧")
+                        raise RuntimeError(f"本帧有 {unknown} 个低置信度格子")
                 score = self._candidate_score(rows, confidences, keypoint_scores)
                 if best is None or score > best[0]:
                     best = (
@@ -417,17 +485,23 @@ class NeuralBoardRecognizer:
                         rows,
                         confidences,
                         layout,
+                        tuple(bbox),
                     )
                 # A legal board with both kings and uniformly high class
                 # confidence does not need the slower fallback regions.
                 if score >= 1.45:
                     break
+            except (InterruptedError, TransientBoardFrame):
+                raise
             except Exception as exc:
                 errors.append(str(exc))
         if best is None:
+            self.tracking_failures = 0
             detail = errors[0] if errors else "没有候选区域"
             raise RuntimeError(f"深度模型没有可靠定位到棋盘：{detail}")
-        _, keypoints, keypoint_scores, transformed, rows, confidences, layout = best
+        _, keypoints, keypoint_scores, transformed, rows, confidences, layout, chosen_bbox = best
+        self.last_search_bbox, self.last_image_size = chosen_bbox, image.size
+        self.tracking_failures = 0
         self.last_layout = layout
         self.last_keypoint_scores = [float(value) for value in keypoint_scores]
 
@@ -483,6 +557,13 @@ class NeuralBoardRecognizer:
                 )
         return grid, detections
 
+    @staticmethod
+    def _pose_matches_hint(keypoints, geometry):
+        squares = ((8, 0), (0, 0), (8, 9), (0, 9)) if geometry.rotated else ((0, 9), (8, 9), (0, 0), (8, 0))
+        previous = np.asarray([geometry.point_for_square(square) for square in squares])
+        tolerance = max(2.0, float(np.linalg.norm(previous[1] - previous[0])) / 8 * .20)
+        return bool(np.max(np.linalg.norm(keypoints - previous, axis=1)) <= tolerance)
+
 
 class PieceRecognizer:
     """Pretrained ONNX recognition with the old template method as fallback."""
@@ -505,15 +586,27 @@ class PieceRecognizer:
     def learn(self, piece: str, feature: list[float]) -> None:
         self.template.learn(piece, feature)
 
-    def recognize(self, image: Image.Image) -> tuple[Image.Image, list[Detection]]:
+    def recognize(self, image: Image.Image, *, geometry_hint=None,
+                  minimum_geometry_confidence: float = 0.0,
+                  cancelled=None) -> tuple[Image.Image, list[Detection]]:
         try:
-            result = self._ensure_neural().recognize(image)
+            result = self._ensure_neural().recognize(
+                image, geometry_hint=geometry_hint,
+                minimum_geometry_confidence=minimum_geometry_confidence,
+                cancelled=cancelled,
+            )
             self.last_backend = "onnx"
             self.last_error = ""
             self.last_geometry = self.neural.last_geometry
             return result
+        except InterruptedError:
+            raise
         except Exception as exc:
             self.last_backend = "template-fallback"
             self.last_error = str(exc)
             self.last_geometry = None
+            if cancelled is not None:
+                # Automation requires ONNX. Slow template fallback can never pass
+                # its safety gate and must not delay the emergency stop.
+                raise RuntimeError(self.last_error) from exc
             return self.template.recognize(image)

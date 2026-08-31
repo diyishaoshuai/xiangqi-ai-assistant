@@ -12,3 +12,5 @@
 截图识别使用 [Chinese Chess Recognition](https://github.com/TheOne1006/chinese-chess-recognition) 项目及其 [Hugging Face ONNX 模型](https://huggingface.co/spaces/yolo12138/Chinese_Chess_Recognition)。模型空间声明 MIT 许可证，相关上游 Python 包声明 Apache License 2.0。
 
 ONNX 推理依赖 ONNX Runtime、OpenCV-Python Headless 和 NumPy。对应许可证与第三方组件说明位于 `licenses/vision/`。
+
+本地集成修改（2026-08-31）：`cchess_onnx/base_onnx.py` 限制每个模型会话的 CPU 线程数并关闭空闲自旋，给游戏、界面及急停监听保留响应时间；模型权重未修改。
