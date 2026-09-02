@@ -18,9 +18,12 @@ def main():
     args = parser.parse_args()
     recognizer = PieceRecognizer()
     original = Image.open(args.image).convert("RGB")
+    scale = min(1280 / original.width, 720 / original.height)
+    scaled = original.resize((max(1, round(original.width * scale)),
+                              max(1, round(original.height * scale))))
     cases = [("original", original, args.expected),
              ("rotated", original.transpose(Image.Transpose.ROTATE_180), "b" if args.expected == "w" else "w"),
-             ("scaled", original.resize((1280, 720)), args.expected)]
+             ("scaled", scaled, args.expected)]
     baseline = None
     samples = []
     for name, image, expected in cases:

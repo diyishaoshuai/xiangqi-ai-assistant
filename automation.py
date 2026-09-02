@@ -48,12 +48,24 @@ class ConfirmationKind(str, Enum):
 class BoardTransition:
     kind: TransitionKind
     move: str | None = None
+    board: dict[tuple[int, int], str] | None = None
+    mismatches: int = 0
 
 
 @dataclass(frozen=True)
 class ClickConfirmation:
     kind: ConfirmationKind
     move: str | None = None
+    board: dict[tuple[int, int], str] | None = None
+    mismatches: int = 0
+
+
+@dataclass(frozen=True)
+class LegalPathProjection:
+    moves: tuple[str, ...]
+    board: dict[tuple[int, int], str]
+    next_side: str
+    mismatches: int = 0
 
 
 @dataclass(frozen=True)
@@ -203,11 +215,129 @@ def infer_single_move(
                 if target is not None and piece_side(target) == side:
                     continue
                 move = square_name(start) + square_name(end)
-                if apply_move(before, move) == after:
+                if apply_move(before, move) == after and move_is_legal(before, move, side):
                     candidates.append(move)
                     if len(candidates) > 1:
                         return None
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _between_count(
+    board: dict[tuple[int, int], str],
+    start: tuple[int, int],
+    end: tuple[int, int],
+) -> int | None:
+    sx, sy = start
+    ex, ey = end
+    if sx != ex and sy != ey:
+        return None
+    step_x = 0 if sx == ex else (1 if ex > sx else -1)
+    step_y = 0 if sy == ey else (1 if ey > sy else -1)
+    current = (sx + step_x, sy + step_y)
+    count = 0
+    while current != end:
+        if current in board:
+            count += 1
+        current = (current[0] + step_x, current[1] + step_y)
+    return count
+
+
+def _in_palace(square: tuple[int, int], side: str) -> bool:
+    x, rank = square
+    ranks = range(0, 3) if side == "w" else range(7, 10)
+    return 3 <= x <= 5 and rank in ranks
+
+
+def _piece_move_is_pseudo_legal(
+    board: dict[tuple[int, int], str],
+    start: tuple[int, int],
+    end: tuple[int, int],
+) -> bool:
+    piece = board.get(start)
+    if piece is None or start == end:
+        return False
+    side = piece_side(piece)
+    target = board.get(end)
+    if target is not None and piece_side(target) == side:
+        return False
+    sx, sy = start
+    ex, ey = end
+    dx, dy = ex - sx, ey - sy
+    kind = piece.upper()
+
+    if kind == "K":
+        if target is not None and target.upper() == "K" and sx == ex:
+            return _between_count(board, start, end) == 0
+        return _in_palace(end, side) and abs(dx) + abs(dy) == 1
+    if kind == "A":
+        return _in_palace(end, side) and abs(dx) == abs(dy) == 1
+    if kind == "B":
+        own_half = ey <= 4 if side == "w" else ey >= 5
+        eye = (sx + dx // 2, sy + dy // 2)
+        return own_half and abs(dx) == abs(dy) == 2 and eye not in board
+    if kind == "N":
+        if sorted((abs(dx), abs(dy))) != [1, 2]:
+            return False
+        leg = (
+            (sx + (1 if dx > 0 else -1), sy)
+            if abs(dx) == 2
+            else (sx, sy + (1 if dy > 0 else -1))
+        )
+        return leg not in board
+    if kind == "R":
+        return _between_count(board, start, end) == 0
+    if kind == "C":
+        between = _between_count(board, start, end)
+        return between == (1 if target is not None else 0)
+    if kind == "P":
+        forward = 1 if side == "w" else -1
+        crossed = sy >= 5 if side == "w" else sy <= 4
+        return (dx == 0 and dy == forward) or (
+            crossed and dy == 0 and abs(dx) == 1
+        )
+    return False
+
+
+def _square_attacked(
+    board: dict[tuple[int, int], str],
+    square: tuple[int, int],
+    attacker_side: str,
+) -> bool:
+    for start, piece in board.items():
+        if piece_side(piece) != attacker_side:
+            continue
+        # Pseudo-legal attack geometry is sufficient here; checking whether
+        # the attacking side exposes its own king would recurse indefinitely.
+        if _piece_move_is_pseudo_legal(board, start, square):
+            return True
+    return False
+
+
+def move_is_legal(
+    board: dict[tuple[int, int], str],
+    move: str,
+    side: str,
+) -> bool:
+    """Validate Xiangqi movement and reject moves that leave one's king checked."""
+    try:
+        start = (FILES.index(move[0]), int(move[1]))
+        end = (FILES.index(move[2]), int(move[3]))
+    except (ValueError, IndexError):
+        return False
+    if not all(0 <= x <= 8 and 0 <= rank <= 9 for x, rank in (start, end)):
+        return False
+    piece = board.get(start)
+    if piece is None or piece_side(piece) != side:
+        return False
+    if not _piece_move_is_pseudo_legal(board, start, end):
+        return False
+    after = apply_move(board, move)
+    king = "K" if side == "w" else "k"
+    king_square = next((square for square, value in after.items() if value == king), None)
+    if king_square is None:
+        return False
+    opponent = "b" if side == "w" else "w"
+    return not _square_attacked(after, king_square, opponent)
 
 
 def position_is_safe(board: dict[tuple[int, int], str]) -> bool:
@@ -222,22 +352,115 @@ def position_is_terminal(board: dict[tuple[int, int], str]) -> bool:
     return (red_kings, black_kings) in ((1, 0), (0, 1))
 
 
+def _board_mismatch_count(
+    expected: dict[tuple[int, int], str],
+    observed: dict[tuple[int, int], str],
+) -> int:
+    return sum(
+        expected.get(square) != observed.get(square)
+        for square in expected.keys() | observed.keys()
+    )
+
+
+def _legal_successors(
+    board: dict[tuple[int, int], str],
+    side: str,
+):
+    for start, piece in board.items():
+        if piece_side(piece) != side:
+            continue
+        for x in range(9):
+            for rank in range(10):
+                end = (x, rank)
+                if end == start:
+                    continue
+                move = square_name(start) + square_name(end)
+                if move_is_legal(board, move, side):
+                    yield move, apply_move(board, move)
+
+
+def project_legal_path(
+    before: dict[tuple[int, int], str],
+    observed: dict[tuple[int, int], str],
+    side: str,
+    *,
+    max_plies: int = 2,
+    max_mismatches: int = 1,
+) -> LegalPathProjection | None:
+    """Project noisy recognition onto a unique short legal continuation.
+
+    A capture commonly leaves the captured glyph visible for one frame.  The
+    cleared source square is therefore required as positive movement evidence;
+    this prevents a random one-square classifier error from inventing a move.
+    """
+    if before == observed:
+        return LegalPathProjection((), dict(before), side, 0)
+
+    frontier = [(dict(before), side, ())]
+    matches: list[LegalPathProjection] = []
+    for _depth in range(1, max_plies + 1):
+        next_frontier = []
+        for position, turn, path in frontier:
+            for move, expected in _legal_successors(position, turn):
+                next_turn = "b" if turn == "w" else "w"
+                next_path = (*path, move)
+                next_frontier.append((expected, next_turn, next_path))
+                mismatch = _board_mismatch_count(expected, observed)
+                start = (FILES.index(move[0]), int(move[1]))
+                end = (FILES.index(move[2]), int(move[3]))
+                # The mover's source must visibly agree with the projected
+                # board and its destination must contain the moving piece.
+                # Stale capture targets are repaired only when the commanded
+                # move is already known (classify_click_confirmation below).
+                if (
+                    mismatch <= max_mismatches
+                    and observed.get(start) == expected.get(start)
+                    and observed.get(end) == expected.get(end)
+                ):
+                    matches.append(
+                        LegalPathProjection(next_path, expected, next_turn, mismatch)
+                    )
+        frontier = next_frontier
+
+    if not matches:
+        return None
+    best_mismatch = min(item.mismatches for item in matches)
+    best = [item for item in matches if item.mismatches == best_mismatch]
+    # Prefer the shortest explanation, but never guess between equal paths.
+    best_depth = min(len(item.moves) for item in best)
+    best = [item for item in best if len(item.moves) == best_depth]
+    return best[0] if len(best) == 1 else None
+
+
 def classify_board_transition(
     before: dict[tuple[int, int], str],
     after: dict[tuple[int, int], str],
     side: str,
 ) -> BoardTransition:
     if before == after:
-        return BoardTransition(TransitionKind.SAME)
+        return BoardTransition(TransitionKind.SAME, board=dict(before))
     move = infer_single_move(before, after, side)
+    canonical = after
+    mismatches = 0
     if move is None:
-        return BoardTransition(TransitionKind.AMBIGUOUS)
+        projection = project_legal_path(
+            before,
+            after,
+            side,
+            max_plies=1,
+            max_mismatches=1,
+        )
+        if projection is None or len(projection.moves) != 1:
+            return BoardTransition(TransitionKind.AMBIGUOUS)
+        move = projection.moves[0]
+        canonical = projection.board
+        mismatches = projection.mismatches
     kind = (
         TransitionKind.TERMINAL_MOVE
-        if position_is_terminal(after)
+        if position_is_terminal(canonical)
         else TransitionKind.MOVE
     )
-    return BoardTransition(kind, move)
+    return BoardTransition(kind, move, dict(canonical), mismatches)
 
 
 def classify_click_confirmation(
@@ -247,16 +470,38 @@ def classify_click_confirmation(
     opponent_side: str,
 ) -> ClickConfirmation:
     if observed == before:
-        return ClickConfirmation(ConfirmationKind.UNCHANGED)
+        return ClickConfirmation(ConfirmationKind.UNCHANGED, board=dict(before))
     if observed == expected:
-        return ClickConfirmation(ConfirmationKind.EXPECTED)
+        return ClickConfirmation(ConfirmationKind.EXPECTED, board=dict(expected))
+    expected_mismatches = _board_mismatch_count(expected, observed)
+    changed_sources = [
+        square for square, piece in before.items()
+        if expected.get(square) != piece and expected.get(square) is None
+    ]
+    if (
+        expected_mismatches <= 1
+        and len(changed_sources) == 1
+        and observed.get(changed_sources[0]) is None
+    ):
+        return ClickConfirmation(
+            ConfirmationKind.EXPECTED,
+            board=dict(expected),
+            mismatches=expected_mismatches,
+        )
     transition = classify_board_transition(expected, observed, opponent_side)
     if transition.kind == TransitionKind.MOVE:
-        return ClickConfirmation(ConfirmationKind.FAST_REPLY, transition.move)
+        return ClickConfirmation(
+            ConfirmationKind.FAST_REPLY,
+            transition.move,
+            transition.board,
+            transition.mismatches,
+        )
     if transition.kind == TransitionKind.TERMINAL_MOVE:
         return ClickConfirmation(
             ConfirmationKind.TERMINAL_REPLY,
             transition.move,
+            transition.board,
+            transition.mismatches,
         )
     return ClickConfirmation(ConfirmationKind.AMBIGUOUS)
 

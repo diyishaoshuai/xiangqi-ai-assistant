@@ -14,7 +14,9 @@ from automation import (
     classify_click_confirmation,
     click_screen_move,
     infer_single_move,
+    move_is_legal,
     position_is_safe,
+    project_legal_path,
     session_event_is_current,
     turn_for_new_game,
     user_input_is_idle,
@@ -48,7 +50,7 @@ class FakeUser32:
 
 class AutomationTests(unittest.TestCase):
     def test_infers_quiet_move(self):
-        board, _ = parse_fen("4k4/9/9/9/9/9/9/9/4R4/4K4 w - - 0 1")
+        board, _ = parse_fen("4k4/9/9/9/4P4/9/9/9/4R4/4K4 w - - 0 1")
         after = apply_move(board, "e1f1")
         self.assertEqual(infer_single_move(board, after, "w"), "e1f1")
 
@@ -71,7 +73,7 @@ class AutomationTests(unittest.TestCase):
         self.assertFalse(position_is_safe(board))
 
     def test_classifies_same_move_terminal_and_ambiguous(self):
-        board, _ = parse_fen("4k4/9/9/9/9/9/9/9/4R4/4K4 w - - 0 1")
+        board, _ = parse_fen("4k4/9/9/9/4P4/9/9/9/4R4/4K4 w - - 0 1")
         self.assertEqual(
             classify_board_transition(board, board, "w").kind,
             TransitionKind.SAME,
@@ -80,8 +82,9 @@ class AutomationTests(unittest.TestCase):
         transition = classify_board_transition(board, moved, "w")
         self.assertEqual(transition.kind, TransitionKind.MOVE)
         self.assertEqual(transition.move, "e1f1")
-        captured = apply_move(board, "e1e9")
-        terminal = classify_board_transition(board, captured, "w")
+        capture_board, _ = parse_fen("4k4/9/9/9/9/9/9/9/4R4/4K4 w - - 0 1")
+        captured = apply_move(capture_board, "e1e9")
+        terminal = classify_board_transition(capture_board, captured, "w")
         self.assertEqual(terminal.kind, TransitionKind.TERMINAL_MOVE)
         changed_twice = dict(moved)
         changed_twice[(4, 0)] = changed_twice.pop((4, 9))
@@ -92,7 +95,7 @@ class AutomationTests(unittest.TestCase):
 
     def test_click_confirmation_accepts_expected_and_fast_reply(self):
         before, _ = parse_fen(
-            "4k4/9/9/9/9/9/9/9/4R4/4K4 w - - 0 1"
+            "4k4/9/9/9/4P4/9/9/9/4R4/4K4 w - - 0 1"
         )
         expected = apply_move(before, "e1f1")
         self.assertEqual(
@@ -103,7 +106,7 @@ class AutomationTests(unittest.TestCase):
             classify_click_confirmation(before, expected, expected, "b").kind,
             ConfirmationKind.EXPECTED,
         )
-        fast_reply = apply_move(expected, "e9f9")
+        fast_reply = apply_move(expected, "e9d9")
         confirmed = classify_click_confirmation(
             before,
             expected,
@@ -111,7 +114,7 @@ class AutomationTests(unittest.TestCase):
             "b",
         )
         self.assertEqual(confirmed.kind, ConfirmationKind.FAST_REPLY)
-        self.assertEqual(confirmed.move, "e9f9")
+        self.assertEqual(confirmed.move, "e9d9")
         ambiguous = dict(fast_reply)
         ambiguous[(3, 0)] = ambiguous.pop((4, 0))
         self.assertEqual(
@@ -123,6 +126,101 @@ class AutomationTests(unittest.TestCase):
             ).kind,
             ConfirmationKind.AMBIGUOUS,
         )
+
+    def test_unknown_disappearing_capture_is_not_guessed(self):
+        before, _ = parse_fen(
+            "2bakabnr/9/c1n4c1/p3p1p1p/2p6/1r4P2/"
+            "P1P1P3P/2N1C1NC1/5R3/2BAKAB1R b - - 0 1"
+        )
+        expected = apply_move(before, "b4g4")
+        observed = dict(expected)
+        observed[(6, 4)] = "P"  # stale glyph of the captured red pawn
+
+        transition = classify_board_transition(before, observed, "b")
+        self.assertEqual(transition.kind, TransitionKind.AMBIGUOUS)
+
+    def test_click_confirmation_repairs_stale_capture_target(self):
+        before, _ = parse_fen(
+            "2bakabnr/9/c1n4c1/p3p1p1p/2p6/1r4P2/"
+            "P1P1P3P/2N1C1NC1/5R3/2BAKAB1R b - - 0 1"
+        )
+        expected = apply_move(before, "b4g4")
+        observed = dict(expected)
+        observed[(6, 4)] = "P"  # stale glyph of the captured red pawn
+        confirmation = classify_click_confirmation(before, expected, observed, "w")
+        self.assertEqual(confirmation.kind, ConfirmationKind.EXPECTED)
+        self.assertEqual(confirmation.board, expected)
+        self.assertEqual(confirmation.mismatches, 1)
+
+    def test_fast_reply_keeps_commanded_capture_when_old_target_glyph_lingers(self):
+        before, _ = parse_fen(
+            "2bakabnr/9/c1n4c1/p3p1p1p/2p6/1r4P2/"
+            "P1P1P3P/2N1C1NC1/5R3/2BAKAB1R b - - 0 1"
+        )
+        expected = apply_move(before, "b4g4")
+        replied = apply_move(expected, "g2f4")
+        observed = dict(replied)
+        observed[(6, 4)] = "P"  # classifier still sees the captured pawn
+
+        confirmation = classify_click_confirmation(before, expected, observed, "w")
+        self.assertEqual(confirmation.kind, ConfirmationKind.FAST_REPLY)
+        self.assertEqual(confirmation.move, "g2f4")
+        self.assertEqual(confirmation.board, replied)
+        self.assertEqual(confirmation.mismatches, 1)
+
+    def test_restart_can_bridge_two_legal_plies_despite_one_bad_piece(self):
+        before, _ = parse_fen(
+            "2bakabnr/9/c1n4c1/p3p1p1p/2p6/1r4P2/"
+            "P1P1P3P/2N1C1NC1/5R3/2BAKAB1R b - - 0 1"
+        )
+        after_black = apply_move(before, "b4g4")
+        expected = apply_move(after_black, "g2f4")
+        observed = dict(expected)
+        observed[(4, 6)] = "P"  # one unrelated classifier error
+        projection = project_legal_path(before, observed, "b", max_plies=2)
+        self.assertIsNotNone(projection)
+        self.assertEqual(projection.moves, ("b4g4", "g2f4"))
+        self.assertEqual(projection.board, expected)
+        self.assertEqual(projection.next_side, "b")
+
+    def test_transition_rejects_animation_that_looks_like_impossible_horse_move(self):
+        board, _ = parse_fen(
+            "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/"
+            "P1P1P1P1P/1C2C4/9/RNBAKABNR w - - 0 1"
+        )
+        after_red = apply_move(board, "e2e6")
+        fake_animation = apply_move(after_red, "h9e6")
+        self.assertFalse(move_is_legal(after_red, "h9e6", "b"))
+        self.assertIsNone(infer_single_move(after_red, fake_animation, "b"))
+        self.assertEqual(
+            classify_board_transition(after_red, fake_animation, "b").kind,
+            TransitionKind.AMBIGUOUS,
+        )
+
+    def test_move_legality_covers_piece_rules_and_self_check(self):
+        standard, _ = parse_fen(
+            "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/"
+            "P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
+        )
+        self.assertTrue(move_is_legal(standard, "b0c2", "w"))
+        horse_blocked = dict(standard)
+        horse_blocked[(1, 1)] = "P"
+        self.assertFalse(move_is_legal(horse_blocked, "b0c2", "w"))
+        self.assertTrue(move_is_legal(standard, "c0e2", "w"))
+        elephant_blocked = dict(standard)
+        elephant_blocked[(3, 1)] = "P"
+        self.assertFalse(move_is_legal(elephant_blocked, "c0e2", "w"))
+        self.assertTrue(move_is_legal(standard, "d0e1", "w"))
+        self.assertFalse(move_is_legal(standard, "d0c1", "w"))
+        self.assertTrue(move_is_legal(standard, "a0a1", "w"))
+        self.assertTrue(move_is_legal(standard, "b2b3", "w"))
+        self.assertTrue(move_is_legal(standard, "a3a4", "w"))
+        self.assertFalse(move_is_legal(standard, "a3b3", "w"))
+
+        crossed = {(4, 0): "K", (4, 9): "k", (4, 5): "P", (0, 5): "P"}
+        self.assertTrue(move_is_legal(crossed, "a5b5", "w"))
+        facing, _ = parse_fen("4k4/9/9/9/9/9/9/9/4R4/4K4 w - - 0 1")
+        self.assertFalse(move_is_legal(facing, "e1f1", "w"))
 
     def test_standard_new_game_is_red_to_move(self):
         standard, _ = parse_fen(

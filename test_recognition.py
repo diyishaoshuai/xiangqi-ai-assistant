@@ -10,6 +10,17 @@ from recognition import BoardGeometry, PieceRecognizer, NeuralBoardRecognizer
 
 CASES = [
     (
+        Path(r"C:\Users\ZhuanZ1\AppData\Local\Temp\codex-clipboard-b5e1b8ad-6004-45c0-8e29-de30307003ad.png"),
+        {
+            **{(x, 9): piece for x, piece in enumerate("rnbakabnr")},
+            (1, 7): "c", (7, 7): "c",
+            **{(x, 6): "p" for x in range(0, 9, 2)},
+            **{(x, 3): "P" for x in range(0, 9, 2)},
+            (1, 2): "C", (7, 2): "C",
+            **{(x, 0): piece for x, piece in enumerate("RNBAKABNR")},
+        },
+    ),
+    (
         Path(r"C:\Users\ZhuanZ1\AppData\Local\Temp\codex-clipboard-9891a2a1-5b20-4d37-8dca-54c69c6df929.png"),
         {(4, 9): "k", (6, 5): "b", (4, 5): "C", (3, 2): "A", (5, 2): "A", (4, 1): "K", (3, 0): "C"},
     ),
@@ -29,6 +40,38 @@ CASES = [
 
 
 class RecognitionTests(unittest.TestCase):
+    def test_progressive_tiles_cover_small_game_windows_anywhere_on_4k_desktop(self):
+        boxes = NeuralBoardRecognizer._tiled_candidate_bboxes(2160, 3840)
+        self.assertLessEqual(len(boxes), 45)
+        for center in ((1600, 1000), (3000, 700), (350, 1700)):
+            self.assertTrue(any(left <= center[0] <= right and top <= center[1] <= bottom
+                                for left, top, right, bottom in boxes), center)
+
+    def test_standard_start_calibration_recovers_unknown_piece_types_but_not_ambiguous_sides(self):
+        import numpy as np
+        expected = [list("rnbakabnr"), list("........."), list(".c.....c."),
+                    list("p.p.p.p.p"), list("........."), list("........."),
+                    list("P.P.P.P.P"), list(".C.....C."), list("........."),
+                    list("RNBAKABNR")]
+        shifted = [["." for _ in range(9)] for _ in range(10)]
+        for row in range(10):
+            for column in range(9):
+                if expected[row][column] != ".":
+                    shifted[row][column] = "p" if row < 5 else "P"
+        confidence = np.full((10, 9), .91)
+        rows, scores, calibrated = NeuralBoardRecognizer._calibrate_standard_start(
+            shifted, confidence)
+        self.assertTrue(calibrated)
+        self.assertEqual(rows, expected)
+        self.assertGreaterEqual(scores[0][4], .78)
+
+        ambiguous = [["x" if expected[row][column] != "." else "." for column in range(9)]
+                     for row in range(10)]
+        rows, _, calibrated = NeuralBoardRecognizer._calibrate_standard_start(
+            ambiguous, confidence)
+        self.assertFalse(calibrated)
+        self.assertEqual(rows, ambiguous)
+
     def test_cancellation_never_runs_template_fallback(self):
         recognizer = PieceRecognizer()
         recognizer.neural = Mock()
@@ -85,6 +128,47 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(rotated.point_for_square((0, 0)), (400.0, 50.0))
         self.assertEqual(rotated.point_for_square((8, 9)), (50.0, 450.0))
 
+    def test_piece_click_prefers_observed_disc_center(self):
+        geometry = BoardGeometry(
+            (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            False,
+            1.0,
+            (500, 500),
+            ((4, 0, 227.5, 452.0),),
+        )
+        self.assertEqual(geometry.point_for_piece((4, 0)), (227.5, 452.0))
+        self.assertEqual(
+            geometry.point_for_piece((3, 0)),
+            geometry.point_for_square((3, 0)),
+        )
+
+    def test_fast_geometry_refresh_runs_pose_without_full_classifier(self):
+        import numpy as np
+        recognizer = object.__new__(NeuralBoardRecognizer)
+        keypoints = np.float32([[50, 50], [400, 50], [50, 450], [400, 450]])
+        recognizer.pose = Mock()
+        recognizer.pose.pred.return_value = keypoints, np.full(4, .8)
+        recognizer.classifier = Mock()
+        recognizer.last_search_bbox = (0, 0, 500, 500)
+        recognizer.last_image_size = (500, 500)
+        recognizer.last_geometry = None
+        recognizer.last_timings = {}
+        hint = BoardGeometry(
+            (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            False,
+            .8,
+            (500, 500),
+        )
+        geometry = recognizer.refresh_geometry(
+            Image.new("RGB", (500, 500), "white"),
+            hint,
+            {(4, 0): "K", (4, 9): "k"},
+        )
+        self.assertAlmostEqual(geometry.confidence, .8)
+        recognizer.pose.pred.assert_called_once()
+        recognizer.classifier.pred.assert_not_called()
+        self.assertIn("fast_pose_ms", recognizer.last_timings)
+
     def test_supplied_game_screenshots(self):
         available_cases = [case for case in CASES if case[0].exists()]
         if not available_cases:
@@ -97,8 +181,26 @@ class RecognitionTests(unittest.TestCase):
                 self.assertEqual(recognizer.last_backend, "onnx")
                 self.assertEqual(actual, expected)
 
+    def test_small_portrait_game_inside_4k_desktop_uses_progressive_search(self):
+        path, expected = CASES[0]
+        if not path.exists():
+            self.skipTest("JJ 象棋截图不在当前电脑上")
+        source = Image.open(path).convert("RGB")
+        desktop = Image.new("RGB", (3840, 2160), (36, 39, 42))
+        game = source.resize((542, 1000))
+        desktop.paste(game, (1408, 500))
+        recognizer = PieceRecognizer()
+        _, detections = recognizer.recognize(
+            desktop, minimum_geometry_confidence=.1, cancelled=lambda: False)
+        self.assertEqual({item.square: item.piece for item in detections}, expected)
+        self.assertGreater(recognizer.neural.last_timings["regions"], 4)
+        self.assertGreaterEqual(recognizer.last_geometry.confidence, .1)
+
     def test_autoplay_tracking_uses_fresh_models_at_multiple_resolutions(self):
-        available_cases = [case for case in CASES[:3] if case[0].exists()]
+        # These original landscape screenshots intentionally exercise a 16:9
+        # resize.  The portrait JJ fixture has its own aspect-preserving 4K
+        # desktop test above.
+        available_cases = [case for case in CASES[1:4] if case[0].exists()]
         if not available_cases:
             self.skipTest("原始临时截图不在当前电脑上")
         recognizer = PieceRecognizer()

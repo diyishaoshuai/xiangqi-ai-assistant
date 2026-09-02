@@ -99,6 +99,23 @@ class AutoplayFlowTests(unittest.TestCase):
         self.assertTrue(harness.statuses)
         self.assertEqual(harness.recoveries[-1][0], 7)
 
+    def test_capture_confirmation_has_a_bounded_wait(self):
+        board = {(4, 9): "k", (4, 0): "K"}
+        ambiguous = {(3, 9): "k", (4, 0): "K"}
+        harness = CaptureHarness([(ambiguous, None, object())] * 8)
+        clock = iter((0.0, 0.4, 1.0, 1.6, 2.2, 2.6, 3.0))
+        with patch("app.time.monotonic", side_effect=lambda: next(clock)):
+            with self.assertRaises(TimeoutError):
+                XiangqiApp._capture_stable_mouse_board(
+                    harness,
+                    7,
+                    threading.Event(),
+                    stable_frames=1,
+                    accept=lambda candidate: candidate == board,
+                    max_wait_seconds=2.4,
+                )
+        self.assertGreaterEqual(harness.sleep_count, 1)
+
     def test_click_waits_for_foreground_and_user_idle_then_recovers(self):
         board = {(4, 9): "k", (4, 0): "K"}
         geometry = object()
@@ -129,6 +146,67 @@ class AutoplayFlowTests(unittest.TestCase):
         states = [state for _, state, _ in harness.statuses]
         self.assertIn(AutomationState.WAITING_BOARD, states)
         self.assertIn(AutomationState.WAITING_USER_IDLE, states)
+
+    def test_click_retry_forces_full_relock_and_skips_cached_geometry(self):
+        board = {(4, 9): "k", (4, 0): "K"}
+        geometry = object()
+        harness = ClickReadyHarness((board, "grid", geometry))
+        harness._capture_unchanged_click_board = Mock()
+        harness._capture_fast_click_board = Mock()
+        harness._capture_stable_mouse_board = Mock(
+            return_value=(board, "grid", geometry)
+        )
+        with (
+            patch("app.foreground_window", return_value=42),
+            patch("app.user_input_is_idle", return_value=True),
+        ):
+            kind, result = XiangqiApp._wait_for_click_ready(
+                harness,
+                8,
+                threading.Event(),
+                42,
+                board,
+                board,
+                {},
+                force_full_relock=True,
+            )
+        self.assertEqual(kind, "ready")
+        self.assertIs(result[2], geometry)
+        harness._capture_unchanged_click_board.assert_not_called()
+        harness._capture_fast_click_board.assert_not_called()
+        self.assertEqual(
+            harness._capture_stable_mouse_board.call_args.kwargs["stable_frames"],
+            2,
+        )
+
+    def test_click_retry_falls_back_to_fresh_pose_when_selection_glow_blocks_classifier(self):
+        board = {(4, 9): "k", (4, 0): "K", (7, 0): "N"}
+        geometry = object()
+        harness = ClickReadyHarness(None)
+        harness._capture_unchanged_click_board = Mock()
+        harness._capture_stable_mouse_board = Mock(
+            side_effect=TimeoutError("选中光效")
+        )
+        harness._capture_fast_click_board = Mock(
+            return_value=(board, "grid", geometry)
+        )
+        with (
+            patch("app.foreground_window", return_value=42),
+            patch("app.user_input_is_idle", return_value=True),
+        ):
+            kind, result = XiangqiApp._wait_for_click_ready(
+                harness,
+                8,
+                threading.Event(),
+                42,
+                board,
+                board,
+                {},
+                force_full_relock=True,
+            )
+        self.assertEqual(kind, "ready")
+        self.assertEqual(result, (board, "grid", geometry))
+        harness._capture_fast_click_board.assert_called_once()
 
 
 class AutoplayLifecycleTests(unittest.TestCase):
@@ -220,7 +298,18 @@ class AutoplayLifecycleTests(unittest.TestCase):
         board, _ = parse_fen("9/3k2C2/3a2N2/9/3PPR3/3r5/3N5/3p5/2r1p4/3K5 w - - 0 1")
         move = "g7e6"  # Actual recommendation from the user's failure log.
         expected = apply_move(board, move)
-        geometry = BoardGeometry((1, 0, 0, 0, 1, 0, 0, 0, 1), False, .8, (500, 500))
+        start, end = parse_move(move)
+        projected_start = BoardGeometry(
+            (1, 0, 0, 0, 1, 0, 0, 0, 1), False, .8, (500, 500)
+        ).point_for_square(start)
+        observed_start = (projected_start[0] + 7.0, projected_start[1] - 5.0)
+        geometry = BoardGeometry(
+            (1, 0, 0, 0, 1, 0, 0, 0, 1),
+            False,
+            .8,
+            (500, 500),
+            ((start[0], start[1], *observed_start),),
+        )
         app._capture_mouse_board = Mock(side_effect=[(board, None, geometry)] * 6 + [(expected, None, geometry)] * 2)
         app._mouse_sleep = Mock()
         app._window_for_geometry = Mock(return_value=42)
@@ -243,8 +332,10 @@ class AutoplayLifecycleTests(unittest.TestCase):
         with patch("app.foreground_window", return_value=42), patch("app.user_input_is_idle", return_value=True), patch("app.click_screen_move", side_effect=simulated_click) as click:
             app._mouse_autoplay_worker(7, app.mouse_auto_stop_event, "w", "w", 500, 1)
         click.assert_called_once()
-        start, end = parse_move(move)
-        self.assertEqual(click.call_args.args[:2], (geometry.point_for_square(start), geometry.point_for_square(end)))
+        self.assertEqual(
+            click.call_args.args[:2],
+            (geometry.point_for_square(start), geometry.point_for_square(end)),
+        )
         self.assertEqual(len(cursor.mouse_events), 4)
         messages = list(app.result_queue.queue)
         self.assertEqual([payload[1] for kind, payload in messages if kind == "mouse_board"][-1], expected)
@@ -287,12 +378,14 @@ class AutoplayLifecycleTests(unittest.TestCase):
             if captures in (1, 2):
                 return initial, None, geometry
             if captures == 3:
+                self.assertEqual(kwargs["stable_frames"], 1)
+                self.assertEqual(kwargs["max_wait_seconds"], 6.0)
                 self.assertFalse(kwargs["accept"](initial))  # No immediate blind retry.
+                self.assertFalse(kwargs["accept"](initial))  # Animation frames never authorize a second click.
                 self.assertTrue(kwargs["accept"](reply))
-                kwargs["on_candidate"](reply)  # First frame starts search.
+                kwargs["on_candidate"](reply)  # The explainable frame starts search.
                 self.assertTrue(search_started.wait(1))
                 self.assertEqual(click.call_count, 1)  # Only the PREVIOUS move clicked.
-                kwargs["on_candidate"](reply)  # Second independent frame agrees.
                 vision_confirmed = True
                 allow_result.set()
                 return reply, None, geometry
@@ -313,8 +406,8 @@ class AutoplayLifecycleTests(unittest.TestCase):
         def send_move(*args, **kwargs):
             if click.call_count == 2:
                 self.assertTrue(vision_confirmed)
-            self.assertEqual(kwargs["pause_seconds"], .10)
-            self.assertEqual(kwargs["settle_seconds"], .03)
+            self.assertEqual(kwargs["pause_seconds"], .18)
+            self.assertEqual(kwargs["settle_seconds"], .05)
             from automation import ClickResult
             return ClickResult(True, True, 2)
 

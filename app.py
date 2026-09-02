@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
+import math
 import queue
 import sys
 import threading
@@ -71,6 +72,7 @@ from automation import (
     foreground_window,
     position_is_safe,
     position_is_terminal,
+    project_legal_path,
     session_event_is_current,
     turn_for_new_game,
     user_input_is_idle,
@@ -260,6 +262,11 @@ class XiangqiApp:
         self.mouse_auto_recovery_count = 0
         self.mouse_hotkey_latch = HotkeyLatch(was_pressed=f1_pressed())
         self.mouse_auto_frame_cache = UnchangedBoardCache()
+        self.mouse_resume_board: dict[tuple[int, int], str] | None = None
+        self.mouse_resume_side: str | None = None
+        self.mouse_resume_history_fen = ""
+        self.mouse_resume_moves: list[str] = []
+        self.mouse_resume_at = 0.0
         self.mouse_hotkey_queue = queue.Queue()
         self.global_hotkey = None
         self.mouse_auto_button: ttk.Button | None = None
@@ -1459,6 +1466,18 @@ class XiangqiApp:
         current_side = self.side
         movetime = int(self.time_var.get())
         multipv = int(self.multipv_var.get())
+        resume_state = None
+        if (
+            self.mouse_resume_board is not None
+            and self.mouse_resume_side in ("w", "b")
+            and time.monotonic() - self.mouse_resume_at <= 180.0
+        ):
+            resume_state = (
+                dict(self.mouse_resume_board),
+                self.mouse_resume_side,
+                self.mouse_resume_history_fen,
+                list(self.mouse_resume_moves),
+            )
         self.root.update_idletasks()
         self.root.withdraw()
         worker = threading.Thread(
@@ -1470,6 +1489,7 @@ class XiangqiApp:
                 current_side,
                 movetime,
                 multipv,
+                resume_state,
             ),
             daemon=True,
             name=f"mouse-autoplay-{session_id}",
@@ -1663,6 +1683,59 @@ class XiangqiApp:
                              session_id, (time.monotonic() - started) * 1000)
         return current
 
+    def _capture_fast_click_board(self, session_id, stop_event, board):
+        """Refresh only the four board corners before clicking.
+
+        Full 90-intersection classification is intentionally reserved for a
+        failed fast lock.  The board was already confirmed as the opponent's
+        completed move, while this fresh pose pass keeps physical click points
+        aligned with the current screen frame.
+        """
+        if self._mouse_autoplay_cancelled(session_id, stop_event):
+            raise InterruptedError("用户已停止自动接管")
+        cache = getattr(self, "mouse_auto_frame_cache", None)
+        hint = getattr(self, "mouse_auto_geometry", None)
+        if hint is None and cache is not None:
+            hint = cache.geometry
+        if hint is None:
+            return None
+        started = time.monotonic()
+        image = ImageGrab.grab()
+        cancelled = lambda: self._mouse_autoplay_cancelled(session_id, stop_event)
+        if cancelled():
+            raise InterruptedError("用户已停止自动接管")
+        try:
+            geometry = self.recognizer.refresh_geometry(
+                image,
+                hint,
+                board,
+                minimum_geometry_confidence=0.10,
+                cancelled=cancelled,
+            )
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            self.logger.info(
+                "mouse autoplay fast pose unavailable session=%s elapsed_ms=%.1f reason=%s",
+                session_id,
+                (time.monotonic() - started) * 1000,
+                exc,
+            )
+            return None
+        if cancelled():
+            raise InterruptedError("用户已停止自动接管")
+        self.mouse_auto_geometry = geometry
+        grid = cache.grid if cache is not None else None
+        self.logger.info(
+            "mouse autoplay fast pose session=%s elapsed_ms=%.1f confidence=%.3f snapped_pieces=%s stages=%s",
+            session_id,
+            (time.monotonic() - started) * 1000,
+            geometry.confidence,
+            len(geometry.piece_centers),
+            getattr(getattr(self.recognizer, "neural", None), "last_timings", None),
+        )
+        return dict(board), grid, geometry
+
     def _capture_stable_mouse_board(
         self,
         session_id: int,
@@ -1672,10 +1745,12 @@ class XiangqiApp:
         allow_terminal: bool = False,
         accept=None,
         on_candidate=None,
+        max_wait_seconds: float | None = None,
         state: AutomationState = AutomationState.WAITING_BOARD,
         status: str = "棋盘暂不可用，正在等待自动恢复",
     ):
         tracker = StableBoardTracker(stable_frames)
+        wait_started = time.monotonic()
         latest = None
         last_detail = ""
         recovery_detail = ""
@@ -1722,6 +1797,11 @@ class XiangqiApp:
                     state,
                     f"{status}：{detail}；F1 急停",
                 )
+            if (
+                max_wait_seconds is not None
+                and time.monotonic() - wait_started >= max_wait_seconds
+            ):
+                raise TimeoutError(last_detail or "等待稳定棋盘超时")
             # These are still independent screenshots, not repeated reads of one
             # image. Unchanged frames no longer need a full model inference.
             self._mouse_sleep(session_id, stop_event, 0.06 if not detail else 0.12)
@@ -1736,6 +1816,13 @@ class XiangqiApp:
         moves: list[str],
         status: str,
     ) -> None:
+        # This is the canonical, legally confirmed state—not a raw recognition
+        # result. Keep it as a short-lived recovery anchor for F1 restart/relock.
+        self.mouse_resume_board = dict(board)
+        self.mouse_resume_side = side
+        self.mouse_resume_history_fen = history_fen
+        self.mouse_resume_moves = list(moves)
+        self.mouse_resume_at = time.monotonic()
         self.result_queue.put(
             (
                 "mouse_board",
@@ -1776,6 +1863,8 @@ class XiangqiApp:
         board,
         session_start_board,
         standard_board,
+        *,
+        force_full_relock: bool = False,
     ):
         pause_reason = ""
         while True:
@@ -1797,15 +1886,37 @@ class XiangqiApp:
                 )
                 self._mouse_sleep(session_id, stop_event, 0.10)
                 continue
-            current = self._capture_unchanged_click_board(session_id, stop_event, board)
-            if current is None:
-                current = self._capture_stable_mouse_board(
+            current = None
+            if not force_full_relock:
+                current = self._capture_unchanged_click_board(session_id, stop_event, board)
+            fast_capture = getattr(self, "_capture_fast_click_board", None)
+            if current is None and not force_full_relock and callable(fast_capture):
+                current = fast_capture(
                     session_id,
                     stop_event,
-                    stable_frames=3,
-                    state=AutomationState.WAITING_BOARD,
-                    status="画面发生变化，点击前正在重新确认棋盘",
+                    board,
                 )
+            if current is None:
+                try:
+                    current = self._capture_stable_mouse_board(
+                        session_id,
+                        stop_event,
+                        stable_frames=2 if force_full_relock else 3,
+                        max_wait_seconds=2.8 if force_full_relock else None,
+                        state=AutomationState.WAITING_BOARD,
+                        status="画面发生变化，点击前正在重新确认棋盘",
+                    )
+                except TimeoutError:
+                    if not force_full_relock or not callable(fast_capture):
+                        raise
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_BOARD,
+                        "选中光效干扰完整识别，改用新帧网格坐标立即重试；F1 急停",
+                    )
+                    current = fast_capture(session_id, stop_event, board)
+                    if current is None:
+                        continue
             candidate = current[0]
             if candidate == board:
                 if (
@@ -1823,6 +1934,19 @@ class XiangqiApp:
                 standard_board,
             ):
                 return "new_game", current
+            if force_full_relock and callable(fast_capture):
+                # Selection glows and move hints can alter classifier labels even
+                # though the physical board has not changed.  A fresh pose-only
+                # lock is sufficient for a bounded retry because the move itself
+                # was already calculated from a previously confirmed position.
+                fallback = fast_capture(session_id, stop_event, board)
+                if fallback is not None:
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_BOARD,
+                        "盘面受选中光效干扰，已重新锁定十字坐标并继续重试；F1 急停",
+                    )
+                    return "ready", fallback
             self._queue_mouse_status(
                 session_id,
                 AutomationState.WAITING_BOARD,
@@ -1837,12 +1961,14 @@ class XiangqiApp:
         current_side: str,
         movetime: int,
         requested_multipv: int,
+        resume_state=None,
     ) -> None:
         history_fen = ""
         move_history: list[str] = []
         visits: deque[str] = deque(maxlen=24)
         used_moves: dict[str, set[str]] = {}
         consecutive_checks = 0
+        forced_loss_streak = 0
         game_over = False
         session_start_turn = current_side
         standard_board, _ = parse_fen(START_FEN)
@@ -1885,7 +2011,7 @@ class XiangqiApp:
                 "正在连续识别三帧并锁定游戏窗口；F1 急停",
             )
             while True:
-                board, grid, geometry = self._capture_stable_mouse_board(
+                captured_board, grid, geometry = self._capture_stable_mouse_board(
                     session_id,
                     stop_event,
                     stable_frames=3,
@@ -1894,7 +2020,35 @@ class XiangqiApp:
                 )
                 target_window = self._window_for_geometry(geometry)
                 if target_window and foreground_window() == target_window:
-                    break
+                    if captured_board == standard_board or resume_state is None:
+                        board = captured_board
+                        break
+                    anchor_board, anchor_side, anchor_history_fen, anchor_moves = resume_state
+                    projection = project_legal_path(
+                        anchor_board,
+                        captured_board,
+                        anchor_side,
+                        max_plies=2,
+                        # On restart, never prefer a visually closer but false
+                        # legal line. Noisy frames must settle before adoption.
+                        max_mismatches=0,
+                    )
+                    if projection is not None:
+                        board = projection.board
+                        current_side = projection.next_side
+                        history_fen = anchor_history_fen
+                        move_history = [*anchor_moves, *projection.moves]
+                        self.logger.info(
+                            "mouse autoplay resumed legal path session=%s moves=%s",
+                            session_id,
+                            " ".join(projection.moves) or "(same)",
+                        )
+                        break
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_BOARD,
+                        "当前画面无法衔接最后确认棋局，正在等待清晰稳定帧；F1 急停",
+                    )
                 self._queue_mouse_status(
                     session_id,
                     AutomationState.WAITING_BOARD,
@@ -1905,8 +2059,9 @@ class XiangqiApp:
             session_start_board = dict(board)
             assisted_side = identify_player(board, geometry)
             # Standard starts are red-to-move, even when the user plays black.
-            current_side = turn_for_new_game(board, standard_board, current_side)
-            history_fen = make_fen(board, current_side)
+            if board == standard_board or not history_fen:
+                current_side = turn_for_new_game(board, standard_board, current_side)
+                history_fen = make_fen(board, current_side)
             visits.append(history_fen)
             self._queue_mouse_board(
                 session_id,
@@ -1921,7 +2076,7 @@ class XiangqiApp:
             def adopt_new_game(candidate, new_grid, new_geometry) -> bool:
                 nonlocal board, grid, geometry, target_window
                 nonlocal current_side, history_fen, move_history, visits
-                nonlocal used_moves, consecutive_checks, game_over
+                nonlocal used_moves, consecutive_checks, forced_loss_streak, game_over
                 nonlocal session_start_board
                 nonlocal assisted_side
                 prefetch.cancel()
@@ -1949,6 +2104,7 @@ class XiangqiApp:
                 visits = deque([history_fen], maxlen=24)
                 used_moves = {}
                 consecutive_checks = 0
+                forced_loss_streak = 0
                 game_over = False
                 self.logger.info(
                     "mouse autoplay new game reset session=%s side=%s fen=%s",
@@ -1992,7 +2148,7 @@ class XiangqiApp:
                     self._queue_mouse_status(
                         session_id,
                         AutomationState.WAITING_OPPONENT,
-                        "等待对手走子并进行双帧确认；F1 急停",
+                        "等待对手走子并进行快速确认；F1 急停",
                     )
 
                     def acceptable_opponent_board(candidate) -> bool:
@@ -2016,14 +2172,22 @@ class XiangqiApp:
                     def prepare_opponent_reply(candidate):
                         transition = classify_board_transition(board, candidate, current_side) if candidate is not None else None
                         if transition is not None and transition.kind == TransitionKind.MOVE:
-                            offer_candidate(candidate, [*move_history, transition.move], consecutive_checks)
+                            offer_candidate(
+                                transition.board or candidate,
+                                [*move_history, transition.move],
+                                consecutive_checks,
+                            )
                         else:
                             prefetch.cancel()
 
                     next_board, grid, geometry = self._capture_stable_mouse_board(
                         session_id,
                         stop_event,
-                        stable_frames=2,
+                        # A single full ONNX result is accepted only when it
+                        # exactly explains one move from the confirmed board.
+                        # That transition proof is stronger and much faster
+                        # than rerunning the expensive classifier unchanged.
+                        stable_frames=1,
                         allow_terminal=True,
                         accept=acceptable_opponent_board,
                         on_candidate=prepare_opponent_reply,
@@ -2043,11 +2207,12 @@ class XiangqiApp:
                     if opponent_move is None:
                         continue
                     self.logger.info(
-                        "mouse autoplay observed opponent move=%s",
+                        "mouse autoplay observed opponent move=%s vision_mismatches=%s",
                         opponent_move,
+                        transition.mismatches,
                     )
                     move_history.append(opponent_move)
-                    board = next_board
+                    board = transition.board or next_board
                     current_side = assisted_side
                     signature = make_fen(board, current_side)
                     visits.append(signature)
@@ -2131,6 +2296,22 @@ class XiangqiApp:
                         f"{reason}；已停止本局点击并等待下一局，F1 急停",
                     )
                     continue
+                line = lines[0]
+                wdl = getattr(line, "wdl", None)
+                forced_loss = (
+                    getattr(line, "depth", 0) >= 10
+                    and wdl is not None
+                    and tuple(wdl) == (0, 0, 1000)
+                )
+                forced_loss_streak = forced_loss_streak + 1 if forced_loss else 0
+                if forced_loss_streak >= 2:
+                    game_over = True
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_NEXT_GAME,
+                        "连续两回合确认当前为 100% 败势，建议认输；已停止本局点击并等待下一局，F1 急停",
+                    )
+                    continue
 
                 start, end = parse_move(bestmove)
                 moving_piece = board.get(start)
@@ -2161,6 +2342,7 @@ class XiangqiApp:
                         before,
                         session_start_board,
                         standard_board,
+                        force_full_relock=click_attempts > 0,
                     )
                     fresh_board, grid, geometry = fresh
                     if ready_kind == "new_game":
@@ -2173,6 +2355,7 @@ class XiangqiApp:
                     if auto_detect_side and bottom_player_side(fresh_board, geometry) != assisted_side:
                         raise FatalAutomationError("点击前检测到棋盘朝向改变或执棋方不明确，已禁止点击。请确认当前对局后重新接管。")
                     start_point = geometry.point_for_square(start)
+                    observed_piece_center = geometry.point_for_piece(start)
                     end_point = geometry.point_for_square(end)
                     width, height = geometry.image_size
                     if any(
@@ -2192,10 +2375,14 @@ class XiangqiApp:
                         f"正在代走：{move_text}；F1 急停",
                     )
                     self.logger.info(
-                        "mouse autoplay latency session=%s move=%s budget_ms=%s think_ms=%.1f after_think_ms=%.1f",
+                        "mouse autoplay latency session=%s move=%s budget_ms=%s think_ms=%.1f after_think_ms=%.1f "
+                        "start=(%.1f,%.1f) start_snap_px=%.1f end=(%.1f,%.1f)",
                         session_id, bestmove, movetime,
                         (thinking_finished - thinking_started) * 1000,
                         (time.monotonic() - thinking_finished) * 1000,
+                        start_point[0], start_point[1],
+                        math.dist(observed_piece_center, start_point),
+                        end_point[0], end_point[1],
                     )
                     first_click_sent = False
                     transaction_completed = False
@@ -2208,8 +2395,8 @@ class XiangqiApp:
                                 stop_event,
                             ),
                             guard=lambda: foreground_window() == target_window,
-                            pause_seconds=0.10 if click_attempts == 0 else 0.18,
-                            settle_seconds=0.03 if click_attempts == 0 else 0.06,
+                            pause_seconds=0.18 if click_attempts == 0 else 0.24,
+                            settle_seconds=0.05 if click_attempts == 0 else 0.08,
                         )
                         first_click_sent = click_result.first_click_sent
                         transaction_completed = click_result.completed
@@ -2262,20 +2449,31 @@ class XiangqiApp:
                         "已发送落子，正在确认游戏画面；F1 急停",
                     )
                     unchanged_retry_after = time.monotonic() + 0.60
+                    click_was_dispatched = transaction_completed or first_click_sent
+                    animation_frames = 0
                     if transaction_completed or first_click_sent:
                         self._mouse_sleep(session_id, stop_event, 0.10)
 
                     opponent_side = "b" if current_side == "w" else "w"
 
                     def plausible_confirmation(candidate) -> bool:
+                        nonlocal animation_frames
                         confirmation = classify_click_confirmation(
                             before,
                             expected,
                             candidate,
                             opponent_side,
                         )
-                        if confirmation.kind == ConfirmationKind.UNCHANGED and time.monotonic() < unchanged_retry_after:
-                            return False  # Let the client process a click; never retry too early.
+                        if confirmation.kind == ConfirmationKind.UNCHANGED:
+                            if click_was_dispatched:
+                                # A complete click is an irreversible transaction.
+                                # JJ Xiangqi can keep showing the source position
+                                # throughout its move animation; never resend the
+                                # same move merely because such a frame was seen.
+                                animation_frames += 1
+                                return False
+                            if time.monotonic() < unchanged_retry_after:
+                                return False
                         return (
                             confirmation.kind != ConfirmationKind.AMBIGUOUS
                             or self._known_new_game_board(
@@ -2289,29 +2487,64 @@ class XiangqiApp:
                     def prepare_fast_reply(candidate):
                         confirmation = classify_click_confirmation(before, expected, candidate, opponent_side) if candidate is not None else None
                         if confirmation is not None and confirmation.kind == ConfirmationKind.FAST_REPLY:
-                            offer_candidate(candidate, [*move_history, bestmove, confirmation.move], next_checks)
+                            offer_candidate(
+                                confirmation.board or candidate,
+                                [*move_history, bestmove, confirmation.move],
+                                next_checks,
+                            )
                         else:
                             prefetch.cancel()
 
                     allow_unchanged = click_attempts < 3
-                    confirmed_board, grid, geometry = self._capture_stable_mouse_board(
-                        session_id,
-                        stop_event,
-                        stable_frames=2 if allow_unchanged else 3,
-                        allow_terminal=True,
-                        on_candidate=prepare_fast_reply,
-                        accept=(
-                            plausible_confirmation
-                            if allow_unchanged
-                            else lambda item: item != before and plausible_confirmation(item)
-                        ),
-                        state=AutomationState.WAITING_BOARD,
-                        status=(
-                            "正在确认落子结果"
-                            if allow_unchanged
-                            else "连续三次未能完成点击，已停止重试并等待盘面变化"
-                        ),
-                    )
+                    try:
+                        confirmed_board, grid, geometry = self._capture_stable_mouse_board(
+                            session_id,
+                            stop_event,
+                            stable_frames=1 if allow_unchanged else 2,
+                            allow_terminal=True,
+                            on_candidate=prepare_fast_reply,
+                            accept=(
+                                plausible_confirmation
+                                if allow_unchanged
+                                else lambda item: item != before and plausible_confirmation(item)
+                            ),
+                            max_wait_seconds=(
+                                6.0 if click_was_dispatched
+                                else (2.4 if allow_unchanged else 4.0)
+                            ),
+                            state=AutomationState.WAITING_BOARD,
+                            status=(
+                                "正在确认落子结果"
+                                if allow_unchanged
+                                else "连续三次未能完成点击，正在做最后确认"
+                            ),
+                        )
+                    except TimeoutError as exc:
+                        self.logger.warning(
+                            "mouse autoplay confirmation timeout session=%s attempt=%s move=%s animation_frames=%s dispatched=%s reason=%s",
+                            session_id,
+                            click_attempts,
+                            bestmove,
+                            animation_frames,
+                            click_was_dispatched,
+                            exc,
+                        )
+                        if click_was_dispatched:
+                            raise FatalAutomationError(
+                                f"落子点击已经发出，但等待动画结束后仍无法确认：{move_text}。"
+                                "已停止接管，避免重复执行同一步。"
+                            ) from exc
+                        if click_attempts < 3:
+                            self._queue_mouse_status(
+                                session_id,
+                                AutomationState.WAITING_BOARD,
+                                f"落子确认超时（第 {click_attempts}/3 次），立即重新点击；F1 急停",
+                            )
+                            self._mouse_sleep(session_id, stop_event, 0.12)
+                            continue
+                        raise FatalAutomationError(
+                            f"连续三次点击后仍无法确认落子：{move_text}。已停止接管，避免无期限等待导致超时。"
+                        ) from exc
                     if confirmed_board == before:
                         self.logger.warning(
                             "mouse autoplay move not applied session=%s attempt=%s move=%s",
@@ -2339,12 +2572,33 @@ class XiangqiApp:
                         )
                         break
 
+                    confirmation = classify_click_confirmation(
+                        before,
+                        expected,
+                        confirmed_board,
+                        opponent_side,
+                    )
+                    if confirmation.kind == ConfirmationKind.AMBIGUOUS:
+                        self._queue_mouse_status(
+                            session_id,
+                            AutomationState.WAITING_BOARD,
+                            "落子后盘面暂时无法解释，保持待机并继续重锁；F1 急停",
+                        )
+                        continue
+
                     used_moves.setdefault(signature, set()).add(bestmove)
                     move_history.append(bestmove)
                     consecutive_checks = next_checks
 
-                    if confirmed_board == expected:
-                        board = confirmed_board
+                    if confirmation.kind == ConfirmationKind.EXPECTED:
+                        if confirmation.mismatches:
+                            self.logger.warning(
+                                "mouse autoplay repaired commanded move recognition session=%s move=%s mismatches=%s",
+                                session_id,
+                                bestmove,
+                                confirmation.mismatches,
+                            )
+                        board = confirmation.board or expected
                         current_side = opponent_side
                         visits.append(make_fen(board, current_side))
                         if position_is_terminal(board):
@@ -2365,28 +2619,16 @@ class XiangqiApp:
                         move_finished = True
                         continue
 
-                    confirmation = classify_click_confirmation(
-                        before,
-                        expected,
-                        confirmed_board,
-                        opponent_side,
-                    )
-                    if confirmation.kind == ConfirmationKind.AMBIGUOUS:
-                        self._queue_mouse_status(
-                            session_id,
-                            AutomationState.WAITING_BOARD,
-                            "落子后盘面暂时无法解释，保持待机并继续重锁；F1 急停",
-                        )
-                        continue
                     fast_reply = confirmation.move
                     if fast_reply is None:
                         continue
                     self.logger.info(
-                        "mouse autoplay observed fast opponent reply=%s",
+                        "mouse autoplay observed fast opponent reply=%s vision_mismatches=%s",
                         fast_reply,
+                        confirmation.mismatches,
                     )
                     move_history.append(fast_reply)
-                    board = confirmed_board
+                    board = confirmation.board or confirmed_board
                     current_side = assisted_side
                     visits.append(make_fen(board, current_side))
                     self._queue_mouse_board(

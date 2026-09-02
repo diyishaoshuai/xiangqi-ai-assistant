@@ -1,3 +1,4 @@
+import os
 import onnxruntime
 import numpy as np
 import cv2
@@ -15,7 +16,13 @@ class BaseONNX(ABC):
         # Local desktop integration: leave CPU time for the game, engine and
         # emergency-key/UI threads instead of two default full-core pools.
         options = onnxruntime.SessionOptions()
-        options.intra_op_num_threads = 2
+        # Classification is on the critical path after an opponent move.  Use
+        # up to six workers on modern desktops while leaving ample capacity
+        # for Pikafish, the game and the emergency hotkey thread.
+        options.intra_op_num_threads = max(
+            2,
+            min(6, max(1, (os.cpu_count() or 4) // 2)),
+        )
         options.inter_op_num_threads = 1
         options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         options.add_session_config_entry("session.inter_op.allow_spinning", "0")

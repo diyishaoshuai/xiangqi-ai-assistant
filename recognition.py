@@ -60,6 +60,7 @@ class BoardGeometry:
     rotated: bool
     confidence: float
     image_size: tuple[int, int]
+    piece_centers: tuple[tuple[int, int, float, float], ...] = ()
 
     def point_for_square(self, square: tuple[int, int]) -> tuple[float, float]:
         x, rank = square
@@ -85,6 +86,13 @@ class BoardGeometry:
             matrix[3] * target_x + matrix[4] * target_y + matrix[5]
         ) / denominator
         return source_x, source_y
+
+    def point_for_piece(self, square: tuple[int, int]) -> tuple[float, float]:
+        """Return the detected disc centre, falling back to its intersection."""
+        for x, rank, center_x, center_y in self.piece_centers:
+            if (x, rank) == square:
+                return center_x, center_y
+        return self.point_for_square(square)
 
 
 def _feature(patch: Image.Image, red: bool) -> list[float]:
@@ -307,7 +315,7 @@ class NeuralBoardRecognizer:
         self.last_timings = {}
 
     @staticmethod
-    def _validate_keypoints(image_rgb, keypoints) -> None:
+    def _validate_keypoints(image_rgb, keypoints, search_bbox=None) -> None:
         height, width = image_rgb.shape[:2]
         if keypoints.shape != (4, 2) or not np.isfinite(keypoints).all():
             raise RuntimeError("棋盘关键点无效")
@@ -319,7 +327,17 @@ class NeuralBoardRecognizer:
         bottom_width = float(np.linalg.norm(keypoints[3] - keypoints[2]))
         left_height = float(np.linalg.norm(keypoints[2] - keypoints[0]))
         right_height = float(np.linalg.norm(keypoints[3] - keypoints[1]))
-        if area < width * height * 0.025:
+        # A phone/emulator board may occupy only a small part of a 4K desktop.
+        # Judge its size against the region sent to the pose model, not always
+        # against the whole screenshot.  Absolute edge limits still prevent a
+        # tiny false positive from becoming clickable geometry.
+        reference_area = width * height
+        if search_bbox is not None:
+            left, top, right, bottom = search_bbox
+            reference_area = max(1, min(width, right) - max(0, left)) * max(
+                1, min(height, bottom) - max(0, top)
+            )
+        if area < reference_area * 0.025:
             raise RuntimeError("没有可靠定位到完整棋盘")
         if min(top_width, bottom_width, left_height, right_height) < 80:
             raise RuntimeError("识别到的棋盘尺寸过小")
@@ -371,6 +389,107 @@ class NeuralBoardRecognizer:
         return unique
 
     @staticmethod
+    def _tiled_candidate_bboxes(height: int, width: int) -> list[list[int]]:
+        """Cover small game windows anywhere on a large desktop.
+
+        These regions are only reached when the cheap whole/left/right search
+        did not produce a trustworthy board, so an already locked platform
+        keeps its previous latency.  Two scales cover a typical desktop game
+        window and a narrow phone/emulator window without assuming its x/y.
+        """
+        short = min(height, width)
+        candidates: list[list[int]] = []
+
+        def origins(length: int, extent: int) -> list[int]:
+            if extent >= length:
+                return [0]
+            step = max(1, round(extent * 0.60))
+            values = list(range(0, length - extent + 1, step))
+            end = length - extent
+            if not values or values[-1] != end:
+                values.append(end)
+            return values
+
+        for fraction in (0.65, 0.42):
+            extent = max(240, min(short, round(short * fraction)))
+            for top in origins(height, extent):
+                for left in origins(width, extent):
+                    candidates.append([left, top, left + extent, top + extent])
+        return candidates
+
+    @staticmethod
+    def _candidate_is_plausible(rows: list[list[str]]) -> bool:
+        labels = [label for row in rows for label in row]
+        limits = {
+            "K": 1, "A": 2, "B": 2, "N": 2, "R": 2, "C": 2, "P": 5,
+            "k": 1, "a": 2, "b": 2, "n": 2, "r": 2, "c": 2, "p": 5,
+        }
+        if any(labels.count(piece) > limit for piece, limit in limits.items()):
+            return False
+        if labels.count("K") != 1 or labels.count("k") != 1:
+            return False
+        red = next((row for row, values in enumerate(rows) if "K" in values), -1)
+        black = next((row for row, values in enumerate(rows) if "k" in values), -1)
+        return (red <= 2 and black >= 7) or (black <= 2 and red >= 7)
+
+    @staticmethod
+    def _calibrate_standard_start(rows, confidences):
+        """Recover a new visual theme from its unambiguous standard setup.
+
+        Even a domain-shifted classifier generally distinguishes a piece from
+        an empty intersection.  If and only if all 32 occupied intersections
+        exactly match the standard initial layout, their identities are known
+        from coordinates.  Red/black orientation must still have independent
+        visual/classifier evidence; otherwise no correction is made.
+        """
+        occupied = {(row, column) for row in range(10) for column in range(9)
+                    if rows[row][column] != "."}
+        expected = ({(0, column) for column in range(9)}
+                    | {(2, 1), (2, 7)} | {(3, column) for column in range(0, 9, 2)}
+                    | {(6, column) for column in range(0, 9, 2)} | {(7, 1), (7, 7)}
+                    | {(9, column) for column in range(9)})
+        if occupied != expected:
+            return rows, confidences, False
+
+        upper_top = lower_top = upper_bottom = lower_bottom = 0.0
+        for row in (*range(4), *range(6, 10)):
+            for column in range(9):
+                label = rows[row][column]
+                confidence = float(confidences[row][column])
+                if label not in "KABNRCPkabnrcp" or confidence < .55:
+                    continue
+                bottom = row >= 6
+                if label.isupper():
+                    upper_bottom += confidence if bottom else 0.0
+                    upper_top += confidence if not bottom else 0.0
+                else:
+                    lower_bottom += confidence if bottom else 0.0
+                    lower_top += confidence if not bottom else 0.0
+        normal_votes = upper_bottom + lower_top
+        rotated_votes = upper_top + lower_bottom
+        if abs(normal_votes - rotated_votes) < 2.0:
+            return rows, confidences, False
+        red_bottom = normal_votes > rotated_votes
+        black_back = list("rnbakabnr")
+        red_back = list("RNBAKABNR")
+        standard = [["."] * 9 for _ in range(10)]
+        top_back, bottom_back = ((black_back, red_back) if red_bottom else (red_back, black_back))
+        standard[0], standard[9] = top_back, bottom_back
+        top_cannon = "c" if red_bottom else "C"
+        top_pawn = "p" if red_bottom else "P"
+        bottom_cannon = "C" if red_bottom else "c"
+        bottom_pawn = "P" if red_bottom else "p"
+        standard[2][1] = standard[2][7] = top_cannon
+        standard[7][1] = standard[7][7] = bottom_cannon
+        for column in range(0, 9, 2):
+            standard[3][column] = top_pawn
+            standard[6][column] = bottom_pawn
+        calibrated = [[float(value) for value in row] for row in confidences]
+        for row, column in expected:
+            calibrated[row][column] = max(.78, min(.94, calibrated[row][column]))
+        return standard, calibrated, True
+
+    @staticmethod
     def _candidate_score(
         rows: list[list[str]], confidences: list[list[float]], keypoint_scores
     ) -> float:
@@ -411,6 +530,230 @@ class NeuralBoardRecognizer:
         return [max(0, int(left - pad_x)), max(0, int(top - pad_y)),
                 min(width, int(right + pad_x)), min(height, int(bottom + pad_y))]
 
+    @staticmethod
+    def _normalized_square(square: tuple[int, int], rotated: bool) -> tuple[float, float]:
+        x, rank = square
+        column, row = ((8 - x, rank) if rotated else (x, 9 - rank))
+        return 50.0 + column * (350.0 / 8.0), 50.0 + row * (400.0 / 9.0)
+
+    @classmethod
+    def _geometry_from_keypoints(
+        cls,
+        keypoints,
+        keypoint_scores,
+        *,
+        rotated: bool,
+        image_size: tuple[int, int],
+    ) -> BoardGeometry:
+        normalized_corners = np.float32(
+            [[50, 50], [400, 50], [50, 450], [400, 450]]
+        )
+        inverse = cv2.getPerspectiveTransform(
+            normalized_corners,
+            np.float32(keypoints),
+        )
+        return BoardGeometry(
+            inverse_matrix=tuple(float(value) for value in inverse.reshape(-1)),
+            rotated=rotated,
+            confidence=min((float(value) for value in keypoint_scores), default=0.0),
+            image_size=image_size,
+        )
+
+    @staticmethod
+    def _grid_step(geometry: BoardGeometry) -> float:
+        samples = []
+        for x in (0, 4, 7):
+            for rank in (0, 4, 9):
+                if x < 8:
+                    samples.append(math.dist(
+                        geometry.point_for_square((x, rank)),
+                        geometry.point_for_square((x + 1, rank)),
+                    ))
+                if rank < 9:
+                    samples.append(math.dist(
+                        geometry.point_for_square((x, rank)),
+                        geometry.point_for_square((x, rank + 1)),
+                    ))
+        return float(np.median(samples)) if samples else 0.0
+
+    @classmethod
+    def _refine_geometry_from_pieces(
+        cls,
+        image: Image.Image,
+        geometry: BoardGeometry,
+        board: dict[tuple[int, int], str],
+    ) -> BoardGeometry:
+        """Fit the grid through detected piece discs and retain exact disc centres.
+
+        The pose network supplies a safe first projection.  Hough circles are
+        only accepted close to known occupied intersections, and RANSAC must
+        agree before the grid transform itself is adjusted.  Sparse or
+        non-circular themes simply keep the pose projection.
+        """
+        if not board or cv2 is None or np is None:
+            return geometry
+        step = cls._grid_step(geometry)
+        if not math.isfinite(step) or step < 16:
+            return geometry
+        all_points = [
+            geometry.point_for_square((x, rank))
+            for x in range(9)
+            for rank in range(10)
+        ]
+        margin = step * 0.65
+        width, height = image.size
+        left = max(0, math.floor(min(point[0] for point in all_points) - margin))
+        top = max(0, math.floor(min(point[1] for point in all_points) - margin))
+        right = min(width, math.ceil(max(point[0] for point in all_points) + margin))
+        bottom = min(height, math.ceil(max(point[1] for point in all_points) + margin))
+        if left >= right or top >= bottom:
+            return geometry
+        gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        crop = gray[top:bottom, left:right]
+        scale = min(1.0, 900.0 / max(crop.shape[:2]))
+        sample = (
+            cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            if scale < 1.0
+            else crop
+        )
+        sample_step = step * scale
+        circles = cv2.HoughCircles(
+            cv2.GaussianBlur(sample, (5, 5), 1.2),
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=max(8.0, sample_step * 0.55),
+            param1=90,
+            param2=max(12.0, sample_step * 0.15),
+            minRadius=max(5, round(sample_step * 0.24)),
+            maxRadius=max(7, round(sample_step * 0.52)),
+        )
+        if circles is None:
+            return geometry
+        candidates = [
+            (left + float(x) / scale, top + float(y) / scale)
+            for x, y, _radius in circles[0]
+        ]
+        matches: dict[tuple[int, int], tuple[float, float]] = {}
+        for square in board:
+            projected = geometry.point_for_square(square)
+            nearby = [
+                center for center in candidates
+                if math.dist(projected, center) <= step * 0.30
+            ]
+            if nearby:
+                matches[square] = min(nearby, key=lambda center: math.dist(projected, center))
+        piece_centers = tuple(
+            (square[0], square[1], center[0], center[1])
+            for square, center in sorted(matches.items())
+        )
+        # Even without enough evidence to alter the complete grid, an
+        # individual source piece can still be clicked at its observed centre.
+        observed = BoardGeometry(
+            geometry.inverse_matrix,
+            geometry.rotated,
+            geometry.confidence,
+            geometry.image_size,
+            piece_centers,
+        )
+        if len(matches) < 6:
+            return observed
+        if len({square[0] for square in matches}) < 3 or len({square[1] for square in matches}) < 3:
+            return observed
+        source = np.float32([
+            cls._normalized_square(square, geometry.rotated)
+            for square in matches
+        ])
+        destination = np.float32([matches[square] for square in matches])
+        matrix, mask = cv2.findHomography(
+            source,
+            destination,
+            cv2.RANSAC,
+            max(2.0, step * 0.08),
+        )
+        if matrix is None or mask is None or int(mask.sum()) < max(5, round(len(matches) * 0.65)):
+            return observed
+        refined = BoardGeometry(
+            tuple(float(value) for value in matrix.reshape(-1)),
+            geometry.rotated,
+            geometry.confidence,
+            geometry.image_size,
+            piece_centers,
+        )
+        corners = ((0, 0), (8, 0), (0, 9), (8, 9))
+        if any(
+            math.dist(geometry.point_for_square(square), refined.point_for_square(square)) > step * 0.35
+            for square in corners
+        ):
+            return observed
+        return refined
+
+    def refresh_geometry(
+        self,
+        image: Image.Image,
+        geometry_hint: BoardGeometry,
+        board: dict[tuple[int, int], str],
+        *,
+        minimum_geometry_confidence: float = 0.10,
+        cancelled=None,
+    ) -> BoardGeometry:
+        """Refresh clickable intersections using pose only, without 90-cell classification."""
+        if geometry_hint is None or geometry_hint.image_size != image.size:
+            raise RuntimeError("棋盘尺寸变化，需要重新完整识别")
+
+        def check_cancelled():
+            if cancelled is not None and cancelled():
+                raise InterruptedError("用户已停止自动接管")
+
+        check_cancelled()
+        started = time.perf_counter()
+        image_rgb = np.asarray(image.convert("RGB"))
+        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        height, width = image_bgr.shape[:2]
+        bboxes = []
+        if self.last_search_bbox is not None and self.last_image_size == image.size:
+            bboxes.append(list(self.last_search_bbox))
+        hinted = self._hint_bbox(geometry_hint, image.size)
+        if hinted is not None and hinted not in bboxes:
+            bboxes.append(hinted)
+        last_error = "没有可用的跟踪区域"
+        for bbox in bboxes:
+            try:
+                check_cancelled()
+                keypoints, scores = self.pose.pred(image=image_bgr, bbox=bbox)
+                check_cancelled()
+                self._validate_keypoints(image_rgb, keypoints, bbox)
+                confidence = min((float(value) for value in scores), default=0.0)
+                if confidence < minimum_geometry_confidence:
+                    raise RuntimeError(f"棋盘定位置信度过低（{confidence:.2f}）")
+                fresh = self._geometry_from_keypoints(
+                    keypoints,
+                    scores,
+                    rotated=geometry_hint.rotated,
+                    image_size=image.size,
+                )
+                old_step = self._grid_step(geometry_hint)
+                corners = ((0, 0), (8, 0), (0, 9), (8, 9))
+                if any(
+                    math.dist(geometry_hint.point_for_square(square), fresh.point_for_square(square))
+                    > max(12.0, old_step * 0.55)
+                    for square in corners
+                ):
+                    raise RuntimeError("棋盘位置变化过大，需要重新完整确认")
+                circle_started = time.perf_counter()
+                fresh = self._refine_geometry_from_pieces(image, fresh, board)
+                self.last_timings = {
+                    "fast_pose_ms": round((circle_started - started) * 1000, 1),
+                    "circle_refine_ms": round((time.perf_counter() - circle_started) * 1000, 1),
+                    "regions": 1,
+                }
+                self.last_geometry = fresh
+                return fresh
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+        raise RuntimeError(f"快速棋盘定位失败：{last_error}")
+
     def recognize(self, image: Image.Image, *, geometry_hint=None,
                   minimum_geometry_confidence: float = 0.0,
                   cancelled=None) -> tuple[Image.Image, list[Detection]]:
@@ -433,7 +776,8 @@ class NeuralBoardRecognizer:
         frame_height, frame_width = image_bgr.shape[:2]
         best = None
         errors: list[str] = []
-        bboxes = self._candidate_bboxes(frame_height, frame_width)
+        primary_bboxes = self._candidate_bboxes(frame_height, frame_width)
+        bboxes = list(primary_bboxes)
         hint_bbox = self._hint_bbox(geometry_hint, image.size)
         if hint_bbox is not None:
             bboxes.insert(0, hint_bbox)
@@ -442,6 +786,7 @@ class NeuralBoardRecognizer:
             previous_bbox = getattr(self, "last_search_bbox", None)
             if previous_bbox is not None and getattr(self, "last_image_size", None) == image.size:
                 bboxes.insert(0, list(previous_bbox))
+        bboxes.extend(self._tiled_candidate_bboxes(frame_height, frame_width))
         bboxes = [list(item) for item in dict.fromkeys(tuple(bbox) for bbox in bboxes)]
         for bbox in bboxes:
             try:
@@ -452,7 +797,7 @@ class NeuralBoardRecognizer:
                     bbox=bbox,
                 )
                 check_cancelled()
-                self._validate_keypoints(image_rgb, keypoints)
+                self._validate_keypoints(image_rgb, keypoints, bbox)
                 # Do not select a high-classification candidate whose coordinates
                 # automation will reject, when another region can locate it safely.
                 if min(keypoint_scores, default=0.0) < minimum_geometry_confidence:
@@ -461,6 +806,9 @@ class NeuralBoardRecognizer:
                 _, rows, confidences, layout = predict(self.classifier, "classifier",
                     transformed, is_rgb=True
                 )
+                rows, confidences, calibrated = self._calibrate_standard_start(rows, confidences)
+                if calibrated:
+                    layout = "\n".join("".join(row) for row in rows)
                 check_cancelled()
                 if minimum_geometry_confidence > 0.0:
                     unknown = sum(label == "x" or (label == "." and float(confidences[r][c]) < .45)
@@ -489,7 +837,7 @@ class NeuralBoardRecognizer:
                     )
                 # A legal board with both kings and uniformly high class
                 # confidence does not need the slower fallback regions.
-                if score >= 1.45:
+                if score >= 1.45 and self._candidate_is_plausible(rows):
                     break
             except (InterruptedError, TransientBoardFrame):
                 raise
@@ -507,17 +855,10 @@ class NeuralBoardRecognizer:
 
         transformed_pil = Image.fromarray(transformed.astype("uint8"))
         rotate = self._needs_rotation(rows)
-        normalized_corners = np.float32(
-            [[50, 50], [400, 50], [50, 450], [400, 450]]
-        )
-        inverse = cv2.getPerspectiveTransform(
-            normalized_corners,
-            np.float32(keypoints),
-        )
-        self.last_geometry = BoardGeometry(
-            inverse_matrix=tuple(float(value) for value in inverse.reshape(-1)),
+        self.last_geometry = self._geometry_from_keypoints(
+            keypoints,
+            keypoint_scores,
             rotated=rotate,
-            confidence=min(self.last_keypoint_scores, default=0.0),
             image_size=image.size,
         )
         grid = transformed_pil.crop((50, 50, 400, 450))
@@ -555,6 +896,21 @@ class NeuralBoardRecognizer:
                         feature=_feature(patch, red=side == "w"),
                     )
                 )
+        board = {
+            detection.square: detection.piece
+            for detection in detections
+            if detection.piece is not None
+        }
+        circle_started = time.perf_counter()
+        self.last_geometry = self._refine_geometry_from_pieces(
+            image,
+            self.last_geometry,
+            board,
+        )
+        self.last_timings["circle_refine_ms"] = round(
+            (time.perf_counter() - circle_started) * 1000,
+            1,
+        )
         return grid, detections
 
     @staticmethod
@@ -585,6 +941,28 @@ class PieceRecognizer:
 
     def learn(self, piece: str, feature: list[float]) -> None:
         self.template.learn(piece, feature)
+
+    def refresh_geometry(
+        self,
+        image: Image.Image,
+        geometry_hint: BoardGeometry,
+        board: dict[tuple[int, int], str],
+        *,
+        minimum_geometry_confidence: float = 0.10,
+        cancelled=None,
+    ) -> BoardGeometry:
+        neural = self._ensure_neural()
+        geometry = neural.refresh_geometry(
+            image,
+            geometry_hint,
+            board,
+            minimum_geometry_confidence=minimum_geometry_confidence,
+            cancelled=cancelled,
+        )
+        self.last_backend = "onnx-fast-pose"
+        self.last_error = ""
+        self.last_geometry = geometry
+        return geometry
 
     def recognize(self, image: Image.Image, *, geometry_hint=None,
                   minimum_geometry_confidence: float = 0.0,

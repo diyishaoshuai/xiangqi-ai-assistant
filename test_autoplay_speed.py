@@ -56,6 +56,8 @@ class PixelProofTests(unittest.TestCase):
         app.mouse_auto_frame_cache = self.cache
         app.logger = Mock()
         app.recognizer = Mock()
+        app.recognizer.refresh_geometry.side_effect = RuntimeError("fast pose unavailable")
+        app.mouse_auto_geometry = self.geometry
         app._capture_stable_mouse_board = Mock(return_value=(self.board, "new grid", self.geometry))
         app._queue_mouse_status = Mock()
         app._mouse_sleep = Mock()
@@ -81,6 +83,28 @@ class PixelProofTests(unittest.TestCase):
             app._wait_for_click_ready(7, app.mouse_auto_stop_event, 42, self.board, {}, {})
         app._capture_stable_mouse_board.assert_called_once()
         self.assertEqual(app._capture_stable_mouse_board.call_args.kwargs["stable_frames"], 3)
+
+    def test_changed_pixels_use_pose_only_before_full_classifier_fallback(self):
+        app = self.make_app()
+        image = self.image.copy()
+        image.putpixel((300, 300), (0, 0, 0))
+        refreshed = BoardGeometry(
+            (1, 0, 101, 0, 1, 30, 0, 0, 1),
+            False,
+            .91,
+            self.image.size,
+            ((0, 0, 151.0, 480.0),),
+        )
+        app.recognizer.refresh_geometry.side_effect = None
+        app.recognizer.refresh_geometry.return_value = refreshed
+        with patch("app.ImageGrab.grab", return_value=image), patch("app.foreground_window", return_value=42), patch("app.user_input_is_idle", return_value=True):
+            kind, current = app._wait_for_click_ready(
+                7, app.mouse_auto_stop_event, 42, self.board, {}, {},
+            )
+        self.assertEqual(kind, "ready")
+        self.assertIs(current[2], refreshed)
+        app.recognizer.refresh_geometry.assert_called_once()
+        app._capture_stable_mouse_board.assert_not_called()
 
     def test_cancel_arriving_during_fast_screenshot_never_returns_click_ready(self):
         app = self.make_app()
