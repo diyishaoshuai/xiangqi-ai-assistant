@@ -137,6 +137,10 @@ class FULL_CLASSIFIER_ONNX(BaseONNX):
 
         # shape (90, 16)
         first_batch_labels = labels[0]
+        # Autoplay consumes the complete distribution to separate occupancy,
+        # side and glyph certainty.  Keeping only argmax made one highlighted
+        # square capable of invalidating an otherwise explainable move.
+        self.last_scores = np.array(first_batch_labels, dtype=np.float32, copy=True)
 
         # 获取置信度最高的标签
         # list[int]

@@ -455,6 +455,11 @@ class WorkspaceView:
         self._switch_row(panel, "显示推荐箭头", self.arrow_var, app.draw_board)
         self._switch_row(panel, "显示识别截图底图", self.background_var, app.draw_board)
         self._switch_row(panel, "窗口置顶", app.always_on_top_var, app._topmost_toggled)
+        ttk.Button(
+            panel,
+            text="清除本机自动接管诊断数据",
+            command=app.clear_diagnostics,
+        ).pack(fill="x", pady=(p(14), 0))
         ttk.Button(panel, text="完成", style="Accent.TButton", command=window.destroy).pack(fill="x", pady=(p(20), 0))
         window.bind("<Escape>", lambda _e: window.destroy())
         window.update_idletasks()

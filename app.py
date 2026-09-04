@@ -51,6 +51,20 @@ from hotkey import GlobalF1Hotkey
 from screen_cache import UnchangedBoardCache
 from search_pipeline import ConfirmedSearch
 from player_side import bottom_player_side
+from tracking import (
+    BoardObservation,
+    DiagnosticRecorder,
+    FrameSource,
+    LegalStateEstimator,
+    MoveTransaction,
+    TransactionState,
+    add_frame_motion,
+    evidence_from_model_scores,
+    overlay_likelihood,
+    select_platform_profile,
+    track_geometry_with_optical_flow,
+    window_identity,
+)
 from ui import (
     ACCENT, BG, BLACK, BOARD, GRID, MUTED, PANEL, PANEL_2, RED, TEXT,
     WorkspaceView, configure_styles, draw_chessboard,
@@ -218,6 +232,11 @@ class XiangqiApp:
         install_exception_logging()
         self.logger = logging.getLogger("xiangqi_ai.app")
         self.logger.info("application session started version=%s resource_base=%s", APP_VERSION, app_base())
+        self.frame_source = FrameSource()
+        self.diagnostic_recorder = DiagnosticRecorder()
+        self.mouse_auto_last_observation: BoardObservation | None = None
+        self.mouse_auto_platform_profile = select_platform_profile()
+        self.mouse_auto_transaction: MoveTransaction | None = None
         self.root = root
         original_report = root.report_callback_exception
 
@@ -468,6 +487,60 @@ class XiangqiApp:
             self.status_var.set(f"已打开日志：{self.log_path}")
         except OSError as exc:
             messagebox.showerror("无法打开日志", f"{self.log_path}\n\n{exc}")
+
+    def clear_diagnostics(self) -> None:
+        try:
+            self.diagnostic_recorder.clear()
+            self.status_var.set("本机自动接管诊断数据已清除")
+        except OSError as exc:
+            self.logger.exception("could not clear diagnostic data")
+            self.status_var.set(f"诊断数据清除失败：{exc}")
+
+    def _save_mouse_transaction_diagnostic(self, session_id: int, reason: str) -> None:
+        transaction = getattr(self, "mouse_auto_transaction", None)
+        recorder = getattr(self, "diagnostic_recorder", None)
+        frame_source = getattr(self, "frame_source", None)
+        if (
+            transaction is None
+            or recorder is None
+            or frame_source is None
+            or transaction.diagnostic_saved
+            or transaction.elapsed < 3.0
+        ):
+            return
+        observation = getattr(self, "mouse_auto_last_observation", None)
+        probability_matrix = None
+        if observation is not None:
+            probability_matrix = {
+                f"{square[0]},{square[1]}": {
+                    "empty": evidence.empty,
+                    "red": evidence.red,
+                    "black": evidence.black,
+                    "occluded": evidence.occluded,
+                    "motion": evidence.motion,
+                    "pieces": evidence.pieces,
+                }
+                for square, evidence in observation.squares.items()
+            }
+        path = recorder.save(
+            "move-uncertain",
+            frame_source.frames,
+            {
+                "session_id": session_id,
+                "move": transaction.move,
+                "state": transaction.state.value,
+                "destination_send_count": transaction.destination_send_count,
+                "terminal_hint": transaction.terminal_hint,
+                "platform": getattr(
+                    getattr(self, "mouse_auto_platform_profile", None), "name", "generic"
+                ),
+                "reason": reason,
+                "probability_matrix": probability_matrix,
+            },
+            getattr(self, "mouse_auto_geometry", None),
+        )
+        transaction.diagnostic_saved = True
+        self.logger.warning("mouse autoplay diagnostic saved path=%s", path)
 
     def show_help_document(self, licenses: bool = False):
         base = app_base()
@@ -1610,7 +1683,10 @@ class XiangqiApp:
         if self._mouse_autoplay_cancelled(session_id, stop_event):
             raise InterruptedError("用户已停止自动接管")
         started = time.monotonic()
-        image = ImageGrab.grab() if image is None else image
+        image = self._grab_screen() if image is None else image
+        # Evidence belongs to one exact capture.  Never let a failed model run
+        # accidentally reuse the preceding frame's probabilities.
+        self.mouse_auto_last_observation = None
         cancelled = lambda: self._mouse_autoplay_cancelled(session_id, stop_event)
         if cancelled():
             raise InterruptedError("用户已停止自动接管")
@@ -1632,6 +1708,7 @@ class XiangqiApp:
                 minimum_geometry_confidence=0.10,
                 cancelled=cancelled,
                 tracking_only=tracking_only,
+                allow_ambiguous=allow_partial,
             )
         except RuntimeError as exc:
             self.logger.debug("mouse capture unavailable session=%s elapsed_ms=%.1f stages=%s reason=%s",
@@ -1659,6 +1736,33 @@ class XiangqiApp:
             if "找不到深度识别模型" in reason or "缺少 ONNX" in reason:
                 raise FatalAutomationError(reason)
             raise RuntimeError(f"本帧无法可靠定位棋盘：{reason}")
+        scores = getattr(
+            getattr(getattr(self.recognizer, "neural", None), "classifier", None),
+            "last_scores",
+            None,
+        )
+        if scores is not None:
+            try:
+                evidence = evidence_from_model_scores(scores, rotated=geometry.rotated)
+                frame_source = getattr(self, "frame_source", None)
+                previous_image = (
+                    frame_source.frames[-2][1]
+                    if frame_source is not None and len(frame_source.frames) >= 2
+                    else None
+                )
+                evidence, stable = add_frame_motion(
+                    evidence, previous_image, image, geometry
+                )
+                self.mouse_auto_last_observation = BoardObservation(
+                    evidence,
+                    geometry,
+                    dict(board),
+                    stable,
+                    getattr(getattr(self, "mouse_auto_platform_profile", None), "name", "generic"),
+                    overlay_likelihood(previous_image, image, geometry),
+                )
+            except Exception:
+                self.logger.exception("could not construct probabilistic board observation")
         required_squares = set(required_squares or ())
         unknown_squares = {item.square for item in unknown}
         if allow_partial and unknown_squares & required_squares:
@@ -1692,6 +1796,10 @@ class XiangqiApp:
             cache.remember(image, board, grid, geometry)
         return board, grid, geometry
 
+    def _grab_screen(self):
+        source = getattr(self, "frame_source", None)
+        return source.grab() if source is not None else ImageGrab.grab()
+
     def _capture_click_endpoints(
         self,
         session_id: int,
@@ -1706,7 +1814,13 @@ class XiangqiApp:
     ):
         """Confirm a dispatched click without requiring all 90 squares."""
         expected_count = unchanged_count = 0
+        source_changed_count = overlay_count = 0
         last_detail = ""
+        estimator = LegalStateEstimator(required_frames=2)
+        transaction = getattr(self, "mouse_auto_transaction", None)
+        profile = getattr(self, "mouse_auto_platform_profile", select_platform_profile())
+        frame_source = getattr(self, "frame_source", None)
+        reference_image = frame_source.frames[-1][1].copy() if frame_source is not None and frame_source.frames else None
         for attempt in range(1, max_attempts + 1):
             try:
                 candidate, grid, geometry = self._capture_mouse_board(
@@ -1717,7 +1831,84 @@ class XiangqiApp:
                     required_squares=(start, end),
                     allow_partial=True,
                 )
-                if position_is_safe(candidate) or position_is_terminal(candidate):
+                observation = getattr(self, "mouse_auto_last_observation", None)
+                if observation is not None and observation.geometry is geometry:
+                    moving_side = "b" if opponent_side == "w" else "w"
+                    estimate = estimator.observe(
+                        observation,
+                        before,
+                        moving_side,
+                        pending_move=getattr(transaction, "move", None),
+                        expected=expected,
+                    )
+                    self.logger.debug(
+                        "mouse autoplay evidence session=%s attempt=%s estimate=%s score=%.4f margin=%.4f accepted=%s "
+                        "source_empty=%.3f destination_side=%.3f source_motion=%.3f destination_motion=%.3f",
+                        session_id,
+                        attempt,
+                        estimate.kind,
+                        estimate.score,
+                        estimate.margin,
+                        estimate.accepted,
+                        observation.squares[start].empty,
+                        observation.squares[end].red if expected.get(end, "").isupper() else observation.squares[end].black,
+                        observation.squares[start].motion,
+                        observation.squares[end].motion,
+                    )
+                    if estimate.accepted and estimate.kind in ("expected", "fast_reply", "terminal"):
+                        terminal = estimate.kind == "terminal"
+                        if transaction is not None:
+                            transaction.commit(terminal=terminal)
+                        return estimate.board or dict(expected), grid, geometry
+                    if observation.endpoint_matches(
+                        start,
+                        end,
+                        expected[end],
+                        threshold=profile.endpoint_threshold,
+                    ):
+                        expected_count += 1
+                        unchanged_count = 0
+                        if expected_count >= 2:
+                            if transaction is not None:
+                                transaction.commit(terminal=False)
+                            self.logger.info(
+                                "mouse autoplay endpoint occupancy confirmed session=%s attempts=%s platform=%s",
+                                session_id, attempt, profile.name,
+                            )
+                            return dict(expected), grid, geometry
+                    elif observation.endpoint_is_unchanged(start, end, before):
+                        unchanged_count += 1
+                        expected_count = 0
+                        if unchanged_count >= 3 and transaction is not None:
+                            # Destination was already sent. This is evidence of
+                            # uncertainty, never authorization to send it again.
+                            transaction.uncertain()
+                    else:
+                        expected_count = unchanged_count = 0
+
+                    if observation.squares[start].empty >= profile.endpoint_threshold:
+                        source_changed_count += 1
+                    else:
+                        source_changed_count = 0
+                    latest_image = frame_source.frames[-1][1] if frame_source is not None and frame_source.frames else None
+                    overlay = (
+                        overlay_likelihood(reference_image, latest_image, geometry)
+                        if latest_image is not None else 0.0
+                    )
+                    overlay_count = overlay_count + 1 if overlay >= profile.terminal_overlay_threshold else 0
+                    if (
+                        transaction is not None
+                        and transaction.terminal_hint
+                        and transaction.destination_send_count == 1
+                        and (source_changed_count >= 2 or overlay_count >= 2)
+                    ):
+                        transaction.commit(terminal=True)
+                        self.logger.info(
+                            "mouse autoplay terminal confirmed from occupancy/overlay session=%s move=%s source_frames=%s overlay_frames=%s overlay=%.3f",
+                            session_id, transaction.move, source_changed_count, overlay_count, overlay,
+                        )
+                        return dict(expected), grid, geometry
+                if observation is None and (position_is_safe(candidate) or position_is_terminal(candidate)):
                     confirmation = classify_click_confirmation(
                         before, expected, candidate, opponent_side
                     )
@@ -1725,35 +1916,43 @@ class XiangqiApp:
                         ConfirmationKind.FAST_REPLY,
                         ConfirmationKind.TERMINAL_REPLY,
                     ):
+                        if transaction is not None:
+                            transaction.commit(
+                                terminal=confirmation.kind == ConfirmationKind.TERMINAL_REPLY
+                            )
                         self.logger.info(
                             "mouse autoplay endpoint confirmation session=%s attempt=%s kind=%s",
                             session_id, attempt, confirmation.kind.value,
                         )
                         return confirmation.board or candidate, grid, geometry
 
-                endpoint_state = (candidate.get(start), candidate.get(end))
-                expected_state = (expected.get(start), expected.get(end))
-                before_state = (before.get(start), before.get(end))
-                if endpoint_state == expected_state:
-                    expected_count += 1
-                    unchanged_count = 0
-                    if expected_count >= 2:
-                        self.logger.info(
-                            "mouse autoplay endpoint confirmation session=%s attempts=%s kind=expected",
-                            session_id, attempt,
-                        )
-                        return dict(expected), grid, geometry
-                elif endpoint_state == before_state:
-                    unchanged_count += 1
-                    expected_count = 0
-                    if unchanged_count >= 3:
-                        self.logger.info(
-                            "mouse autoplay endpoint confirmation session=%s attempts=%s kind=unchanged",
-                            session_id, attempt,
-                        )
-                        return dict(before), grid, geometry
-                else:
-                    expected_count = unchanged_count = 0
+                if observation is None:
+                    endpoint_state = (candidate.get(start), candidate.get(end))
+                    expected_state = (expected.get(start), expected.get(end))
+                    before_state = (before.get(start), before.get(end))
+                    if endpoint_state == expected_state:
+                        expected_count += 1
+                        unchanged_count = 0
+                        if expected_count >= 2:
+                            if transaction is not None:
+                                transaction.commit(terminal=False)
+                            self.logger.info(
+                                "mouse autoplay endpoint confirmation session=%s attempts=%s kind=expected",
+                                session_id, attempt,
+                            )
+                            return dict(expected), grid, geometry
+                    elif endpoint_state == before_state:
+                        unchanged_count += 1
+                        expected_count = 0
+                        if unchanged_count >= 3:
+                            self.logger.info(
+                                "mouse autoplay endpoint confirmation session=%s attempts=%s kind=unchanged",
+                                session_id, attempt,
+                            )
+                            if transaction is not None:
+                                transaction.uncertain()
+                    else:
+                        expected_count = unchanged_count = 0
             except (InterruptedError, FatalAutomationError):
                 raise
             except Exception as exc:
@@ -1767,6 +1966,14 @@ class XiangqiApp:
                     )
             if attempt < max_attempts:
                 self._mouse_sleep(session_id, stop_event, 0.10)
+        if transaction is not None:
+            transaction.uncertain()
+            save_diagnostic = getattr(self, "_save_mouse_transaction_diagnostic", None)
+            if callable(save_diagnostic):
+                try:
+                    save_diagnostic(session_id, last_detail or "端点确认不明确")
+                except Exception:
+                    self.logger.exception("could not save autoplay diagnostic")
         return None
 
     def _wait_for_board_animation_settle(
@@ -1783,6 +1990,9 @@ class XiangqiApp:
         already known board rectangle, so clocks and surrounding UI do not
         cause a false animation signal.
         """
+        profile = getattr(self, "mouse_auto_platform_profile", None)
+        if profile is not None:
+            max_wait_seconds = max(max_wait_seconds, profile.animation_seconds)
         corners = [
             geometry.point_for_square(square)
             for square in ((0, 0), (8, 0), (0, 9), (8, 9))
@@ -1800,15 +2010,31 @@ class XiangqiApp:
             min(height, math.ceil(max(point[1] for point in corners)) + margin),
         )
         previous = None
+        previous_full = None
         stable_comparisons = 0
         started = time.monotonic()
         latest = None
         while True:
             if self._mouse_autoplay_cancelled(session_id, stop_event):
                 raise InterruptedError("用户已停止自动接管")
-            latest = ImageGrab.grab()
+            grabber = getattr(self, "_grab_screen", None)
+            latest = grabber() if callable(grabber) else ImageGrab.grab()
             if latest.size != geometry.image_size:
                 return latest
+            tracked_geometry, drift, flow_reliable = track_geometry_with_optical_flow(
+                previous_full, latest, geometry
+            )
+            if flow_reliable and tracked_geometry is None:
+                self.mouse_auto_geometry = None
+                self.logger.info(
+                    "mouse autoplay optical-flow drift requires full relock session=%s drift_px=%.2f",
+                    session_id,
+                    drift,
+                )
+                return latest
+            if flow_reliable and tracked_geometry is not geometry:
+                geometry = tracked_geometry
+                self.mouse_auto_geometry = tracked_geometry
             probe = latest.crop(bounds).convert("L").resize(
                 (72, 80),
                 Image.Resampling.BILINEAR,
@@ -1825,6 +2051,7 @@ class XiangqiApp:
                     )
                     return latest
             previous = probe
+            previous_full = latest
             if time.monotonic() - started >= max_wait_seconds:
                 self.logger.info(
                     "mouse autoplay animation settle deadline session=%s wait_ms=%.1f",
@@ -1843,7 +2070,8 @@ class XiangqiApp:
             raise InterruptedError("用户已停止自动接管")
         started = time.monotonic()
         try:
-            image = ImageGrab.grab()
+            grabber = getattr(self, "_grab_screen", None)
+            image = grabber() if callable(grabber) else ImageGrab.grab()
             current = cache.match(image, expected_board=board)
         except InterruptedError:
             raise
@@ -1874,7 +2102,8 @@ class XiangqiApp:
         if hint is None:
             return None
         started = time.monotonic()
-        image = ImageGrab.grab()
+        grabber = getattr(self, "_grab_screen", None)
+        image = grabber() if callable(grabber) else ImageGrab.grab()
         cancelled = lambda: self._mouse_autoplay_cancelled(session_id, stop_event)
         if cancelled():
             raise InterruptedError("用户已停止自动接管")
@@ -1961,6 +2190,8 @@ class XiangqiApp:
         last_detail = ""
         recovery_detail = ""
         attempts = 0
+        last_progress_bucket = -1
+        recovery_stage = 0
         while True:
             if self._mouse_autoplay_cancelled(session_id, stop_event):
                 raise InterruptedError("用户已停止自动接管")
@@ -2038,6 +2269,42 @@ class XiangqiApp:
                     state,
                     f"{status}：{detail}；F1 急停",
                 )
+            transaction = getattr(self, "mouse_auto_transaction", None)
+            if transaction is not None and transaction.state in (
+                TransactionState.OBSERVING,
+                TransactionState.UNCERTAIN,
+                TransactionState.DESTINATION_SENT,
+            ):
+                elapsed = transaction.elapsed
+                if elapsed >= 3.0 and recovery_stage < 1:
+                    recovery_stage = 1
+                    transaction.uncertain()
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_BOARD,
+                        "落子暂未确认，正在依次复核端点、完整棋盘、棋盘位置和终局画面；不会重复点击，F1 急停",
+                    )
+                    save_diagnostic = getattr(self, "_save_mouse_transaction_diagnostic", None)
+                    if callable(save_diagnostic):
+                        try:
+                            save_diagnostic(session_id, last_detail or "连续画面无法形成唯一合法状态")
+                        except Exception:
+                            self.logger.exception("could not save autoplay diagnostic")
+                if elapsed >= 8.0 and recovery_stage < 2:
+                    recovery_stage = 2
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_BOARD,
+                        "画面持续不确定，已转为低频安全观察；恢复清晰后自动继续且不会重复点击，F1 急停",
+                    )
+                progress_bucket = int(elapsed // 5)
+                if progress_bucket > last_progress_bucket:
+                    last_progress_bucket = progress_bucket
+                    self._queue_mouse_status(
+                        session_id,
+                        AutomationState.WAITING_BOARD,
+                        f"落子事务已锁定，安全确认中 {int(elapsed)} 秒；不会重复点击，F1 急停",
+                    )
             if (
                 max_wait_seconds is not None
                 and time.monotonic() - wait_started >= max_wait_seconds
@@ -2050,6 +2317,8 @@ class XiangqiApp:
             delay = 0.06 if not detail else 0.12
             if detail and max_attempts is None and tracking_only:
                 delay = min(0.60, 0.12 + attempts * 0.03)
+                if transaction is not None and transaction.elapsed >= 8.0:
+                    delay = 0.75
             self._mouse_sleep(session_id, stop_event, delay)
 
     def _queue_mouse_board(
@@ -2265,6 +2534,16 @@ class XiangqiApp:
                 )
                 target_window = self._window_for_geometry(geometry)
                 if target_window and foreground_window() == target_window:
+                    title, process_name = window_identity(target_window)
+                    self.mouse_auto_platform_profile = select_platform_profile(title, process_name)
+                    self.logger.info(
+                        "mouse autoplay platform session=%s profile=%s title=%r process=%r capture=%s",
+                        session_id,
+                        self.mouse_auto_platform_profile.name,
+                        title,
+                        process_name,
+                        getattr(getattr(self, "frame_source", None), "backend", "pillow"),
+                    )
                     if captured_board == standard_board or resume_state is None:
                         board = captured_board
                         break
@@ -2308,21 +2587,22 @@ class XiangqiApp:
                             )
                             break
                         if pending_confirmation.kind == ConfirmationKind.UNCHANGED:
-                            # Both commanded endpoints still describe the
-                            # pre-click position.  The transaction never took
-                            # effect; safely return to the canonical anchor and
-                            # let the normal click gate try again.
-                            board = dict(anchor_board)
-                            current_side = anchor_side
-                            history_fen = anchor_history_fen
-                            move_history = list(anchor_moves)
-                            self.mouse_resume_pending_board = None
-                            self.logger.info(
-                                "mouse autoplay resumed unapplied transaction session=%s mismatches=%s",
+                            # A prior process already sent this transaction.
+                            # The restart cannot know whether JJ will apply it
+                            # after a delayed animation, so unchanged pixels do
+                            # not authorize a duplicate click.
+                            self.logger.warning(
+                                "mouse autoplay resumed uncertain transaction session=%s mismatches=%s; duplicate suppressed",
                                 session_id,
                                 pending_confirmation.mismatches,
                             )
-                            break
+                            self._queue_mouse_status(
+                                session_id,
+                                AutomationState.WAITING_BOARD,
+                                "上次落子已发送但仍待确认；继续观察且不会重复点击，F1 急停",
+                            )
+                            self._mouse_sleep(session_id, stop_event, 0.30)
+                            continue
                     projection = project_legal_path(
                         anchor_board,
                         captured_board,
@@ -2614,6 +2894,18 @@ class XiangqiApp:
                     checking = False
                 next_checks = consecutive_checks + 1 if checking and not is_king_capture_move(before, bestmove) else 0
                 move_text = describe_move(before, bestmove)
+                terminal_hint = bool(
+                    lines
+                    and lines[0].score_type == "mate"
+                    and lines[0].score == 1
+                )
+                transaction = MoveTransaction(
+                    bestmove,
+                    before,
+                    expected,
+                    terminal_hint=terminal_hint,
+                )
+                self.mouse_auto_transaction = transaction
                 click_attempts = 0
                 move_finished = False
                 new_game_adopted = False
@@ -2687,6 +2979,11 @@ class XiangqiApp:
                         )
                         first_click_sent = click_result.first_click_sent
                         transaction_completed = click_result.completed
+                        if first_click_sent:
+                            transaction.source_sent()
+                        if transaction_completed:
+                            transaction.destination_sent()
+                            transaction.observe()
                         click_attempts += 1
                         self.logger.info(
                             "mouse autoplay click complete session=%s attempt=%s cursor_attempts=%s",
@@ -2697,6 +2994,7 @@ class XiangqiApp:
                     except UserInterferenceError as exc:
                         first_click_sent = exc.first_click_sent
                         if first_click_sent:
+                            transaction.source_sent()
                             click_attempts += 1
                         self.logger.info(
                             "mouse autoplay paused for user input session=%s first_click=%s reason=%s",
@@ -2713,6 +3011,8 @@ class XiangqiApp:
                             continue
                     except RecoverableAutomationError as exc:
                         first_click_sent = exc.first_click_sent
+                        if first_click_sent:
+                            transaction.source_sent()
                         click_attempts += 1
                         self.logger.warning(
                             "mouse autoplay click retry session=%s attempt=%s first_click=%s reason=%s",
@@ -2767,7 +3067,7 @@ class XiangqiApp:
                                 # same move merely because such a frame was seen.
                                 animation_frames += 1
                                 unchanged_confirmations += 1
-                                return unchanged_confirmations >= 2
+                                return False
                             if time.monotonic() < unchanged_retry_after:
                                 return False
                         return (
@@ -2875,20 +3175,46 @@ class XiangqiApp:
                         opponent_side,
                     )
                     if confirmation.kind == ConfirmationKind.UNCHANGED:
-                        self.mouse_resume_pending_board = None
                         self.logger.warning(
-                            "mouse autoplay move not applied session=%s attempt=%s move=%s",
+                            "mouse autoplay move still visually unchanged session=%s attempt=%s move=%s destination_sent=%s",
                             session_id,
                             click_attempts,
                             bestmove,
+                            transaction.destination_send_count,
                         )
-                        self._queue_mouse_status(
-                            session_id,
-                            AutomationState.WAITING_BOARD,
-                            f"落子未生效（第 {click_attempts}/3 次），重新锁盘后再试；F1 急停",
-                        )
-                        self._mouse_sleep(session_id, stop_event, 0.55)
-                        continue
+                        if transaction.destination_send_count == 1:
+                            transaction.uncertain()
+                            self._queue_mouse_status(
+                                session_id,
+                                AutomationState.WAITING_BOARD,
+                                "点击已经发送但画面仍像原局面；保持事务锁定并继续观察，不会重复点击；F1 急停",
+                            )
+                            confirmed_board, grid, geometry = self._capture_stable_mouse_board(
+                                session_id,
+                                stop_event,
+                                stable_frames=1,
+                                allow_terminal=True,
+                                accept=lambda item: item != before and plausible_confirmation(item),
+                                max_wait_seconds=None,
+                                max_attempts=None,
+                                tracking_only=True,
+                                full_relock_every=10,
+                                animation_geometry=geometry,
+                                state=AutomationState.WAITING_BOARD,
+                                status="落子事务待确认，不会重复点击",
+                            )
+                            confirmation = classify_click_confirmation(
+                                before, expected, confirmed_board, opponent_side
+                            )
+                        else:
+                            self.mouse_resume_pending_board = None
+                            self._queue_mouse_status(
+                                session_id,
+                                AutomationState.WAITING_BOARD,
+                                "落子未发送，重新锁盘后再试；F1 急停",
+                            )
+                            self._mouse_sleep(session_id, stop_event, 0.55)
+                            continue
                     if self._known_new_game_board(
                         confirmed_board,
                         before,
@@ -2927,7 +3253,7 @@ class XiangqiApp:
                         board = confirmation.board or expected
                         current_side = opponent_side
                         visits.append(make_fen(board, current_side))
-                        if position_is_terminal(board):
+                        if transaction.state == TransactionState.TERMINAL or position_is_terminal(board):
                             game_over = True
                         self._queue_mouse_board(
                             session_id,
@@ -2943,6 +3269,7 @@ class XiangqiApp:
                             ),
                         )
                         move_finished = True
+                        self.mouse_auto_transaction = None
                         continue
 
                     fast_reply = confirmation.move
@@ -2969,6 +3296,7 @@ class XiangqiApp:
                     if confirmation.kind == ConfirmationKind.TERMINAL_REPLY:
                         game_over = True
                     move_finished = True
+                    self.mouse_auto_transaction = None
 
                 if new_game_adopted:
                     continue
@@ -3029,6 +3357,9 @@ class XiangqiApp:
         for timer in (self._results_poll_after_id, self._hotkey_poll_after_id):
             self.root.after_cancel(timer)
         self.ui.close()
+        frame_source = getattr(self, "frame_source", None)
+        if frame_source is not None:
+            frame_source.close()
         try:
             self.engine.close()
         finally:

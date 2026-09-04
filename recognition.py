@@ -770,7 +770,8 @@ class NeuralBoardRecognizer:
     def recognize(self, image: Image.Image, *, geometry_hint=None,
                   minimum_geometry_confidence: float = 0.0,
                   cancelled=None,
-                  tracking_only: bool = False) -> tuple[Image.Image, list[Detection]]:
+                  tracking_only: bool = False,
+                  allow_ambiguous: bool = False) -> tuple[Image.Image, list[Detection]]:
         def check_cancelled():
             if cancelled is not None and cancelled():
                 raise InterruptedError("用户已停止自动接管")
@@ -827,7 +828,7 @@ class NeuralBoardRecognizer:
                 if calibrated:
                     layout = "\n".join("".join(row) for row in rows)
                 check_cancelled()
-                if minimum_geometry_confidence > 0.0:
+                if minimum_geometry_confidence > 0.0 and not allow_ambiguous:
                     unknown = sum(label == "x" or (label == "." and float(confidences[r][c]) < .45)
                                   for r, row in enumerate(rows) for c, label in enumerate(row))
                     if unknown:
@@ -984,7 +985,8 @@ class PieceRecognizer:
     def recognize(self, image: Image.Image, *, geometry_hint=None,
                   minimum_geometry_confidence: float = 0.0,
                   cancelled=None,
-                  tracking_only: bool = False) -> tuple[Image.Image, list[Detection]]:
+                  tracking_only: bool = False,
+                  allow_ambiguous: bool = False) -> tuple[Image.Image, list[Detection]]:
         previous_geometry = self.last_geometry
         try:
             result = self._ensure_neural().recognize(
@@ -992,6 +994,7 @@ class PieceRecognizer:
                 minimum_geometry_confidence=minimum_geometry_confidence,
                 cancelled=cancelled,
                 tracking_only=tracking_only,
+                allow_ambiguous=allow_ambiguous,
             )
             self.last_backend = "onnx"
             self.last_error = ""

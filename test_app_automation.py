@@ -10,6 +10,7 @@ from automation import AutomationState, ClickResult, click_screen_move
 from core import START_FEN, AnalysisLine, apply_move, parse_fen, parse_move
 from recognition import BoardGeometry, Detection
 from test_automation import FakeUser32
+from tracking import MoveTransaction, TransactionState
 
 
 class CaptureHarness:
@@ -104,12 +105,15 @@ class AutoplayFlowTests(unittest.TestCase):
         self.assertEqual(result, (expected, "grid-2", geometry))
         self.assertEqual(harness.sleep_count, 1)
 
-    def test_endpoint_confirmation_requires_three_unchanged_frames(self):
+    def test_endpoint_confirmation_never_authorizes_a_second_click(self):
         before = {(4, 9): "k", (4, 0): "K", (2, 4): "R"}
         expected = apply_move(before, "c4c5")
         partial = {(2, 4): "R"}
         geometry = object()
         harness = self._endpoint_harness([(partial, None, geometry)] * 3)
+        harness.mouse_auto_transaction = MoveTransaction("c4c5", before, expected)
+        harness.mouse_auto_transaction.destination_sent()
+        harness.mouse_auto_transaction.observe()
         result = XiangqiApp._capture_click_endpoints(
             harness,
             7,
@@ -119,9 +123,12 @@ class AutoplayFlowTests(unittest.TestCase):
             (2, 4),
             (2, 5),
             "b",
+            max_attempts=3,
         )
-        self.assertEqual(result[0], before)
+        self.assertIsNone(result)
         self.assertEqual(harness.sleep_count, 2)
+        self.assertEqual(harness.mouse_auto_transaction.destination_send_count, 1)
+        self.assertEqual(harness.mouse_auto_transaction.state, TransactionState.UNCERTAIN)
 
     def test_partial_capture_accepts_unrelated_unknown_but_not_endpoint_unknown(self):
         geometry = BoardGeometry(
@@ -436,7 +443,7 @@ class AutoplayLifecycleTests(unittest.TestCase):
         self.assertIsNone(app.mouse_resume_pending_board)
         app.engine.analyse.assert_not_called()
 
-    def test_restart_adopts_noisy_unapplied_transaction_and_can_retry(self):
+    def test_restart_waits_for_pending_position_instead_of_retrying(self):
         app = self.make_app()
         anchor, _ = parse_fen(START_FEN)
         move = "g3g4"
@@ -452,7 +459,7 @@ class AutoplayLifecycleTests(unittest.TestCase):
         app.mouse_resume_pending_board = dict(pending)
         app._mouse_sleep = Mock()
         app._capture_stable_mouse_board = Mock(
-            return_value=(observed, None, geometry)
+            side_effect=[(observed, None, geometry), (pending, None, geometry)]
         )
         app._window_for_geometry = Mock(return_value=42)
         published = []
@@ -479,10 +486,11 @@ class AutoplayLifecycleTests(unittest.TestCase):
                 1,
                 resume_state,
             )
-        self.assertEqual(published[0][1], anchor)
-        self.assertEqual(published[0][2], "w")
-        self.assertEqual(published[0][5], [])
+        self.assertEqual(published[0][1], pending)
+        self.assertEqual(published[0][2], "b")
+        self.assertEqual(published[0][5], [move])
         self.assertIsNone(app.mouse_resume_pending_board)
+        app.engine.analyse.assert_not_called()
 
     @patch("app.messagebox.showerror")
     def test_takeover_failure_never_uses_modal_error_dialog(self, showerror):
@@ -661,8 +669,8 @@ class AutoplayLifecycleTests(unittest.TestCase):
                 self.assertTrue(kwargs["tracking_only"])
                 self.assertEqual(kwargs["full_relock_every"], 10)
                 self.assertIs(kwargs["animation_geometry"], geometry)
-                self.assertFalse(kwargs["accept"](initial))  # No immediate blind retry.
-                self.assertTrue(kwargs["accept"](initial))  # Two fresh unchanged proofs authorize a safe retry.
+                self.assertFalse(kwargs["accept"](initial))  # A sent move is never retried.
+                self.assertFalse(kwargs["accept"](initial))
                 self.assertTrue(kwargs["accept"](reply))
                 kwargs["on_candidate"](reply)  # The explainable frame starts search.
                 self.assertTrue(search_started.wait(1))

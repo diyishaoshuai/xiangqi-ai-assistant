@@ -1,5 +1,9 @@
 # 第三方组件说明
 
+DXcam 用作首选的 Windows Desktop Duplication 连续截图后端，采用 MIT
+License；图形复制不可用时程序自动回退 Pillow。源代码：
+https://github.com/ra1nty/DXcam
+
 本工具调用 [Pikafish](https://github.com/official-pikafish/Pikafish) 象棋引擎（版本 2026-01-02）。Pikafish 采用 GNU GPL v3 许可证；对应许可证、作者名单和 NNUE 许可说明位于内嵌的 `licenses/pikafish/`。单 EXE 版运行时可通过“帮助”菜单阅读内嵌说明与许可证，无需外部配套文件。
 
 该版本使用的官方发布包与对应源代码可从以下位置取得：

@@ -27,7 +27,7 @@ a = Analysis(
         (str(project / "README.md"), "."),
         (str(project / "THIRD_PARTY_NOTICES.md"), "."),
     ],
-    hiddenimports=["cv2", "numpy", "onnxruntime"],
+    hiddenimports=["cv2", "numpy", "onnxruntime", "dxcam"],
     runtime_hooks=[str(project / "build_support" / "runtime_hook.py")],
     noarchive=False,
 )

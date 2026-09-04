@@ -2,5 +2,5 @@ numpy>=2.0
 onnxruntime>=1.20
 opencv-python>=4.10
 Pillow>=11.0
+dxcam>=0.0.5
 pyinstaller>=6.10
-

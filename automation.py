@@ -369,7 +369,7 @@ def _board_mismatch_count(
     )
 
 
-def _legal_successors(
+def legal_successors(
     board: dict[tuple[int, int], str],
     side: str,
 ):
@@ -408,7 +408,7 @@ def project_legal_path(
     for _depth in range(1, max_plies + 1):
         next_frontier = []
         for position, turn, path in frontier:
-            for move, expected in _legal_successors(position, turn):
+            for move, expected in legal_successors(position, turn):
                 next_turn = "b" if turn == "w" else "w"
                 next_path = (*path, move)
                 next_frontier.append((expected, next_turn, next_path))
