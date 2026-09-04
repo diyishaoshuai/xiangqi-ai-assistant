@@ -44,12 +44,18 @@ from core import (
     square_name,
     validate_position,
 )
-from engine import EngineError, PikafishEngine
+from engine import EngineError, EngineSearchResult, PikafishEngine
 from app_paths import resource_base as app_base
+from autoplay_state import clear_autoplay_state, load_autoplay_state, save_autoplay_state
 from diagnostics import APP_VERSION, configure_logging, install_exception_logging
 from hotkey import GlobalF1Hotkey
 from screen_cache import UnchangedBoardCache
 from search_pipeline import ConfirmedSearch
+from move_policy import (
+    MoveDecisionPolicy,
+    result_is_legal,
+    restricted_result_is_acceptable,
+)
 from player_side import bottom_player_side
 from tracking import (
     BoardObservation,
@@ -84,6 +90,7 @@ from automation import (
     enable_dpi_awareness,
     f1_pressed,
     foreground_window,
+    legal_successors,
     position_is_safe,
     position_is_terminal,
     project_legal_path,
@@ -108,6 +115,56 @@ def bounded_search_settings(movetime, multipv, *, repeating=False, checking=Fals
     if checking:
         candidates = max(candidates, 12)
     return max(1, int(movetime)), candidates
+
+
+def _coerce_engine_result(value) -> EngineSearchResult:
+    if isinstance(value, EngineSearchResult):
+        return value
+    lines, bestmove = value
+    depth = lines[0].depth if lines else 0
+    return EngineSearchResult(
+        list(lines), bestmove, None, depth, 3, True, "legacy_result", 0.0
+    )
+
+
+def _completed_legal_result(
+    board: dict[tuple[int, int], str],
+    side: str,
+    result: EngineSearchResult,
+) -> EngineSearchResult | None:
+    """Return the deepest complete legal choice; never authorize a mismatched tail."""
+    if result.trusted and result_is_legal(board, side, result):
+        return result
+    line = result.primary
+    if (
+        result.trust_reason == "bestmove_pv_mismatch"
+        and line is not None
+        and result_is_legal(
+            board,
+            side,
+            EngineSearchResult(
+                result.lines,
+                line.best_move,
+                result.ponder,
+                result.completed_depth,
+                result.root_stability,
+                False,
+                result.trust_reason,
+                result.elapsed_ms,
+            ),
+        )
+    ):
+        return EngineSearchResult(
+            result.lines,
+            line.best_move,
+            result.ponder,
+            result.completed_depth,
+            result.root_stability,
+            False,
+            "fallback_last_complete_pv",
+            result.elapsed_ms,
+        )
+    return None
 
 
 def _line_keeps_winning_chances(line: AnalysisLine) -> bool:
@@ -234,6 +291,8 @@ class XiangqiApp:
         self.logger.info("application session started version=%s resource_base=%s", APP_VERSION, app_base())
         self.frame_source = FrameSource()
         self.diagnostic_recorder = DiagnosticRecorder()
+        self.move_decision_policy = MoveDecisionPolicy()
+        self.autoplay_state_enabled = True
         self.mouse_auto_last_observation: BoardObservation | None = None
         self.mouse_auto_platform_profile = select_platform_profile()
         self.mouse_auto_transaction: MoveTransaction | None = None
@@ -1570,7 +1629,22 @@ class XiangqiApp:
                     and time.monotonic() - self.mouse_resume_pending_at <= 180.0
                 )
                 else None,
+                getattr(getattr(self, "mouse_auto_platform_profile", None), "name", "generic"),
             )
+        if resume_state is None:
+            persisted = load_autoplay_state()
+            if persisted is not None:
+                try:
+                    resume_state = (*persisted.resume_tuple(), persisted.platform)
+                    self.logger.info(
+                        "loaded persisted autoplay state platform=%s moves=%s pending=%s",
+                        persisted.platform,
+                        len(persisted.moves),
+                        persisted.pending is not None,
+                    )
+                except (ValueError, TypeError):
+                    clear_autoplay_state()
+                    self.logger.exception("discarded invalid persisted autoplay state")
         self.root.update_idletasks()
         self.root.withdraw()
         worker = threading.Thread(
@@ -2338,6 +2412,7 @@ class XiangqiApp:
         self.mouse_resume_history_fen = history_fen
         self.mouse_resume_moves = list(moves)
         self.mouse_resume_at = time.monotonic()
+        self._persist_mouse_resume_state()
         self.result_queue.put(
             (
                 "mouse_board",
@@ -2352,6 +2427,26 @@ class XiangqiApp:
                 ),
             )
         )
+
+    def _persist_mouse_resume_state(self) -> None:
+        if not getattr(self, "autoplay_state_enabled", False):
+            return
+        if self.mouse_resume_board is None or self.mouse_resume_side not in ("w", "b"):
+            return
+        try:
+            save_autoplay_state(
+                self.mouse_resume_board,
+                self.mouse_resume_side,
+                self.mouse_resume_history_fen,
+                self.mouse_resume_moves,
+                getattr(getattr(self, "mouse_auto_platform_profile", None), "name", "generic"),
+                pending_board=getattr(self, "mouse_resume_pending_board", None),
+                pending_side=getattr(self, "mouse_resume_pending_side", None),
+                pending_history_fen=getattr(self, "mouse_resume_pending_history_fen", ""),
+                pending_moves=getattr(self, "mouse_resume_pending_moves", ()),
+            )
+        except (OSError, ValueError):
+            self.logger.exception("could not persist autoplay recovery state")
 
     @staticmethod
     def _known_new_game_board(
@@ -2468,6 +2563,151 @@ class XiangqiApp:
                 "盘面与思考前不一致，已暂停点击并等待安全重锁；F1 急停",
             )
 
+    def _restricted_autoplay_moves(
+        self,
+        board: dict[tuple[int, int], str],
+        side: str,
+        avoided: set[str],
+        avoid_checks: bool,
+    ) -> list[str]:
+        allowed: list[str] = []
+        for move, _after in legal_successors(board, side):
+            if move in avoided:
+                continue
+            if avoid_checks:
+                try:
+                    if move_gives_check(board, side, move):
+                        continue
+                except ValueError:
+                    continue
+            allowed.append(move)
+        return allowed
+
+    def _choose_autoplay_result(
+        self,
+        session_id: int,
+        stop_event: threading.Event,
+        board: dict[tuple[int, int], str],
+        side: str,
+        signature: str,
+        history_fen: str,
+        move_history: list[str],
+        base_movetime: int,
+        base_value,
+        avoided: set[str],
+        avoid_checks: bool,
+    ) -> EngineSearchResult:
+        cancelled = lambda: self._mouse_autoplay_cancelled(session_id, stop_event)
+        base = _coerce_engine_result(base_value)
+        chosen = base
+        restricted_moves: list[str] | None = None
+        needs_restriction = False
+        if result_is_legal(board, side, base):
+            try:
+                base_checks = move_gives_check(board, side, base.bestmove)
+            except ValueError:
+                base_checks = False
+            short_mate = bool(
+                base.primary is not None
+                and base.primary.score_type == "mate"
+                and 0 < base.primary.score <= 5
+            )
+            needs_restriction = (
+                base.bestmove in avoided
+                or (avoid_checks and base_checks and not short_mate)
+            )
+
+        if needs_restriction:
+            restricted_moves = self._restricted_autoplay_moves(
+                board, side, avoided, avoid_checks
+            )
+            if restricted_moves:
+                restricted_budget = max(base_movetime, 3000)
+                reason = "旧循环" if base.bestmove in avoided else "连续将军"
+                self._queue_mouse_status(
+                    session_id,
+                    AutomationState.THINKING,
+                    f"正在对{reason}替代着进行 {restricted_budget / 1000:g} 秒安全复核；F1 急停",
+                )
+                restricted = _coerce_engine_result(self.engine.analyse(
+                    signature,
+                    restricted_budget,
+                    1,
+                    history_fen=history_fen,
+                    moves=move_history,
+                    root_moves=restricted_moves,
+                    cancelled=cancelled,
+                ))
+                restricted_choice = _completed_legal_result(board, side, restricted)
+                if (
+                    restricted_choice is not None
+                    and restricted_result_is_acceptable(base, restricted_choice)
+                ):
+                    chosen = restricted_choice
+                    self.logger.info(
+                        "autoplay restricted move accepted session=%s reason=%s old=%s new=%s",
+                        session_id,
+                        reason,
+                        base.bestmove,
+                        restricted_choice.bestmove,
+                    )
+                else:
+                    restricted_moves = None
+                    self.logger.info(
+                        "autoplay restricted move rejected session=%s reason=%s old=%s candidate=%s",
+                        session_id,
+                        reason,
+                        base.bestmove,
+                        restricted.bestmove,
+                    )
+
+        policy = getattr(self, "move_decision_policy", None) or MoveDecisionPolicy()
+        risk = policy.assess(board, side, chosen)
+        if risk.needs_verification and (
+            risk.verification_ms > base_movetime or not chosen.trusted
+        ):
+            verify_budget = max(base_movetime, risk.verification_ms)
+            self._queue_mouse_status(
+                session_id,
+                AutomationState.THINKING,
+                f"检测到{risk.status_text}，正在进行 {verify_budget / 1000:g} 秒安全复核；F1 急停",
+            )
+            verified = _coerce_engine_result(self.engine.analyse(
+                signature,
+                verify_budget,
+                1,
+                history_fen=history_fen,
+                moves=move_history,
+                root_moves=restricted_moves,
+                cancelled=cancelled,
+            ))
+            verified_choice = _completed_legal_result(board, side, verified)
+            if verified_choice is not None:
+                chosen = verified_choice
+            self.logger.info(
+                "autoplay safety verification session=%s severity=%s reasons=%r budget_ms=%s "
+                "base_move=%s verified_move=%s depth=%s trusted=%s",
+                session_id,
+                risk.severity,
+                risk.reasons,
+                verify_budget,
+                base.bestmove,
+                verified.bestmove,
+                verified.completed_depth,
+                verified.trusted,
+            )
+        else:
+            self.logger.info(
+                "autoplay safety decision session=%s severity=%s reasons=%r move=%s depth=%s trusted=%s",
+                session_id,
+                risk.severity,
+                risk.reasons,
+                chosen.bestmove,
+                chosen.completed_depth,
+                chosen.trusted,
+            )
+        return chosen
+
     def _mouse_autoplay_worker(
         self,
         session_id: int,
@@ -2484,6 +2724,7 @@ class XiangqiApp:
         used_moves: dict[str, set[str]] = {}
         consecutive_checks = 0
         game_over = False
+        resume_mismatch_count = 0
         session_start_turn = current_side
         standard_board, _ = parse_fen(START_FEN)
         session_start_board: dict[tuple[int, int], str] = {}
@@ -2509,13 +2750,13 @@ class XiangqiApp:
                 prefetch.cancel()
                 return
             fen = make_fen(candidate, assisted_side)
-            repeating = visits.count(fen) + 1 >= 2 and bool(used_moves.get(fen))
-            budget, pv = bounded_search_settings(movetime, requested_multipv,
-                                                 repeating=repeating, checking=checks >= 2)
-            key = prefetch.request_key(fen, budget, pv, history_fen, moves)
+            # Automatic play always spends its base budget on one strongest PV.
+            # Repetition/check alternatives are searched separately after the
+            # board is legally confirmed.
+            key = prefetch.request_key(fen, movetime, 1, history_fen, moves)
             if prefetch.offer(key):
                 self.logger.info("mouse autoplay overlapping search session=%s budget_ms=%s moves=%s; awaiting vision confirmation",
-                                 session_id, budget, " ".join(moves))
+                                 session_id, movetime, " ".join(moves))
 
         try:
             self._mouse_sleep(session_id, stop_event, 0.75)
@@ -2544,10 +2785,53 @@ class XiangqiApp:
                         process_name,
                         getattr(getattr(self, "frame_source", None), "backend", "pillow"),
                     )
-                    if captured_board == standard_board or resume_state is None:
+                    resume_profile = (
+                        resume_state[5]
+                        if resume_state is not None and len(resume_state) > 5
+                        else "generic"
+                    )
+                    if (
+                        resume_state is not None
+                        and resume_profile not in ("generic", self.mouse_auto_platform_profile.name)
+                    ):
+                        self.logger.warning(
+                            "discarded autoplay state from different platform stored=%s current=%s",
+                            resume_profile,
+                            self.mouse_auto_platform_profile.name,
+                        )
+                        clear_autoplay_state()
+                        resume_state = None
+                    if resume_state is None:
                         board = captured_board
                         break
-                    anchor_board, anchor_side, anchor_history_fen, anchor_moves, pending_state = resume_state
+                    anchor_board, anchor_side, anchor_history_fen, anchor_moves, pending_state = resume_state[:5]
+                    if captured_board == standard_board and anchor_board != standard_board:
+                        clear_autoplay_state()
+                        resume_state = None
+                        history_fen = ""
+                        move_history = []
+                        board = captured_board
+                        self.logger.info(
+                            "discarded old autoplay state for standard new game session=%s",
+                            session_id,
+                        )
+                        break
+                    if pending_state is not None and captured_board == anchor_board:
+                        # The previous process already sent the destination.
+                        # JJ can still display the source position during a
+                        # delayed animation; that frame must never downgrade a
+                        # persisted transaction into a fresh clickable anchor.
+                        self.logger.warning(
+                            "mouse autoplay persisted transaction still unchanged session=%s; duplicate suppressed",
+                            session_id,
+                        )
+                        self._queue_mouse_status(
+                            session_id,
+                            AutomationState.WAITING_BOARD,
+                            "上次落子已发送但画面仍未变化；继续观察且不会重复点击，F1 急停",
+                        )
+                        self._mouse_sleep(session_id, stop_event, 0.30)
+                        continue
                     if captured_board == anchor_board:
                         board = dict(anchor_board)
                         current_side = anchor_side
@@ -2620,6 +2904,19 @@ class XiangqiApp:
                             session_id,
                             " ".join(projection.moves) or "(same)",
                         )
+                        break
+                    resume_mismatch_count += 1
+                    if resume_mismatch_count >= 3:
+                        self.logger.warning(
+                            "discarded autoplay state after repeated legal mismatch session=%s profile=%s",
+                            session_id,
+                            self.mouse_auto_platform_profile.name,
+                        )
+                        clear_autoplay_state()
+                        resume_state = None
+                        history_fen = ""
+                        move_history = []
+                        board = captured_board
                         break
                     self._queue_mouse_status(
                         session_id,
@@ -2810,49 +3107,56 @@ class XiangqiApp:
                 visit_count = visits.count(signature)
                 avoided = used_moves.get(signature, set()) if visit_count >= 2 else set()
                 avoid_checks = consecutive_checks >= 2
-                think_time, multipv = bounded_search_settings(
-                    movetime, requested_multipv, repeating=bool(avoided), checking=avoid_checks,
-                )
+                think_time, multipv = movetime, 1
                 self._queue_mouse_status(
                     session_id,
                     AutomationState.THINKING,
-                    f"自动思考中… {think_time / 1000:g} 秒，{multipv} 条候选；F1 急停",
+                    f"自动思考中… 基础 {think_time / 1000:g} 秒，单主变化；F1 急停",
                 )
                 thinking_started = time.monotonic()
                 direct_capture = find_direct_king_capture(board, current_side)
                 if direct_capture is not None:
-                    lines = [
-                        AnalysisLine(
-                            1,
-                            0,
-                            "mate",
-                            1,
-                            [direct_capture],
-                            (1000, 0, 0),
-                        )
-                    ]
-                    bestmove = direct_capture
+                    base_result = EngineSearchResult(
+                        [AnalysisLine(1, 245, "mate", 1, [direct_capture], (1000, 0, 0))],
+                        direct_capture,
+                        None,
+                        245,
+                        3,
+                        True,
+                        "direct_king_capture",
+                        0.0,
+                    )
                 else:
                     key = prefetch.request_key(signature, think_time, multipv, history_fen, move_history)
                     prepared = prefetch.take(key, lambda: self._mouse_autoplay_cancelled(session_id, stop_event))
                     if prepared is None:
-                        lines, bestmove = self.engine.analyse(signature, think_time, multipv,
-                                                             history_fen=history_fen, moves=move_history)
+                        base_result = self.engine.analyse(
+                            signature,
+                            think_time,
+                            multipv,
+                            history_fen=history_fen,
+                            moves=move_history,
+                            cancelled=lambda: self._mouse_autoplay_cancelled(session_id, stop_event),
+                        )
                     else:
-                        lines, bestmove = prepared
+                        base_result = prepared
                         self.logger.info("mouse autoplay confirmed search reused session=%s remaining_wait_ms=%.1f",
                                          session_id, (time.monotonic() - thinking_started) * 1000)
-                    lines, replacement = prefer_fresh_winning_line(lines, set(avoided))
-                    if replacement is not None:
-                        bestmove = replacement
-                    if avoid_checks:
-                        lines, replacement = prefer_quiet_winning_line(
-                            lines,
-                            board,
-                            current_side,
-                        )
-                        if replacement is not None:
-                            bestmove = replacement
+                chosen_result = self._choose_autoplay_result(
+                    session_id,
+                    stop_event,
+                    board,
+                    current_side,
+                    signature,
+                    history_fen,
+                    move_history,
+                    think_time,
+                    base_result,
+                    set(avoided),
+                    avoid_checks,
+                )
+                lines = chosen_result.lines
+                bestmove = chosen_result.bestmove
                 thinking_finished = time.monotonic()
                 if self._mouse_autoplay_cancelled(session_id, stop_event):
                     raise InterruptedError("用户已停止自动接管")
@@ -3048,6 +3352,8 @@ class XiangqiApp:
                         self.mouse_resume_pending_history_fen = history_fen
                         self.mouse_resume_pending_moves = [*move_history, bestmove]
                         self.mouse_resume_pending_at = time.monotonic()
+                        if transaction.destination_send_count == 1:
+                            self._persist_mouse_resume_state()
 
                     unchanged_confirmations = 0
 
@@ -3448,23 +3754,38 @@ def no_win_engine_self_test() -> int:
 
 
 def anti_loop_engine_self_test() -> int:
-    """Regression for the reported king/knight four-ply loop."""
+    """Verify the bounded ``searchmoves`` path used to avoid a known loop."""
     engine = PikafishEngine(find_engine(), threads=8, hash_mb=256)
     history = ["d1d0", "e3f1", "d0d1", "f1e3"]
     try:
-        lines, bestmove = engine.analyse(
+        base = engine.analyse(
             LOOP_TEST_FEN,
-            5000,
-            5,
+            1000,
+            1,
             history_fen=LOOP_TEST_FEN,
             moves=history,
         )
-        promoted, replacement = prefer_fresh_winning_line(lines, {"d1d0"})
-        if not lines or not bestmove:
+        board, side = parse_fen(LOOP_TEST_FEN)
+        for move in history:
+            board = apply_move(board, move)
+            side = "b" if side == "w" else "w"
+        root_moves = [
+            move for move, _after in legal_successors(board, side)
+            if move != "d1d0"
+        ]
+        if not base.lines or not base.bestmove or not root_moves:
             return 42
-        if not promoted or promoted[0].best_move == "d1d0":
+        restricted = engine.analyse(
+            LOOP_TEST_FEN,
+            3000,
+            1,
+            history_fen=LOOP_TEST_FEN,
+            moves=history,
+            root_moves=root_moves,
+        )
+        if restricted.bestmove == "d1d0" or restricted.bestmove not in root_moves:
             return 43
-        if not _line_keeps_winning_chances(promoted[0]):
+        if not restricted.lines or not result_is_legal(board, side, restricted):
             return 44
         return 0
     except Exception:
@@ -3493,6 +3814,36 @@ def anti_check_policy_self_test() -> int:
         return 0
     except Exception:
         return 58
+
+
+def move_safety_self_test() -> int:
+    try:
+        policy = MoveDecisionPolicy()
+        risky_board, risky_side = parse_fen(
+            "2bakcb2/2cR5/n8/C5p2/8p/2p3P2/P3r3P/4B4/4A4/3A1KB2 w - - 0 1"
+        )
+        risky = EngineSearchResult(
+            [AnalysisLine(1, 12, "cp", -469, ["d8c8"], (0, 0, 1000))],
+            "d8c8", "a7c8", 12, 1, True, "self_test", 500.0,
+        )
+        if policy.assess(risky_board, risky_side, risky).verification_ms != 5000:
+            return 59
+        safe_board, safe_side = parse_fen(START_FEN)
+        safe = EngineSearchResult(
+            [AnalysisLine(1, 20, "cp", 40, ["c3c4"], (400, 600, 0))],
+            "c3c4", None, 20, 3, True, "self_test", 500.0,
+        )
+        if policy.assess(safe_board, safe_side, safe).needs_verification:
+            return 60
+        save_autoplay_state(safe_board, safe_side, START_FEN, [], "generic")
+        restored = load_autoplay_state()
+        if restored is None or restored.resume_tuple()[0] != safe_board:
+            return 61
+        clear_autoplay_state()
+        return 0
+    except Exception:
+        clear_autoplay_state()
+        return 62
 
 
 def outcome_guard_self_test() -> int:
@@ -3910,6 +4261,8 @@ if __name__ == "__main__":
         raise SystemExit(anti_loop_engine_self_test())
     if "--anti-check-policy-self-test" in sys.argv:
         raise SystemExit(anti_check_policy_self_test())
+    if "--move-safety-self-test" in sys.argv:
+        raise SystemExit(move_safety_self_test())
     if "--outcome-guard-self-test" in sys.argv:
         raise SystemExit(outcome_guard_self_test())
     if "--recognition-self-test" in sys.argv:

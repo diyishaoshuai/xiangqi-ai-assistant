@@ -492,6 +492,50 @@ class AutoplayLifecycleTests(unittest.TestCase):
         self.assertIsNone(app.mouse_resume_pending_board)
         app.engine.analyse.assert_not_called()
 
+    def test_restart_never_reclicks_when_persisted_transaction_still_shows_anchor(self):
+        app = self.make_app()
+        anchor, _ = parse_fen(START_FEN)
+        move = "g3g4"
+        pending = apply_move(anchor, move)
+        geometry = BoardGeometry(
+            (1, 0, 0, 0, 1, 0, 0, 0, 1), False, .8, (500, 500)
+        )
+        app.mouse_auto_detect_side = False
+        app.mouse_resume_pending_board = dict(pending)
+        app._mouse_sleep = Mock()
+        app._capture_stable_mouse_board = Mock(
+            side_effect=[(anchor, None, geometry), (pending, None, geometry)]
+        )
+        app._window_for_geometry = Mock(return_value=42)
+        published = []
+
+        def publish(*args):
+            published.append(args)
+            app.mouse_auto_stop_event.set()
+
+        app._queue_mouse_board = publish
+        resume_state = (
+            anchor,
+            "w",
+            START_FEN,
+            [],
+            (pending, "b", START_FEN, [move]),
+            "generic",
+        )
+        with patch("app.foreground_window", return_value=42), patch("app.click_screen_move") as click:
+            app._mouse_autoplay_worker(
+                7,
+                app.mouse_auto_stop_event,
+                "w",
+                "w",
+                500,
+                1,
+                resume_state,
+            )
+        click.assert_not_called()
+        app.engine.analyse.assert_not_called()
+        self.assertEqual(published[0][1], pending)
+
     @patch("app.messagebox.showerror")
     def test_takeover_failure_never_uses_modal_error_dialog(self, showerror):
         app = self.make_app()

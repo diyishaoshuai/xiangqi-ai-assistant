@@ -158,6 +158,74 @@ class TimeBudgetTests(unittest.TestCase):
         self.assertLessEqual(logger.debug.call_count, 2)
         self.assertIn("go movetime 500", engine.process.stdin.getvalue())
 
+    def test_engine_uses_completed_iteration_matching_bestmove(self):
+        engine = PikafishEngine(Path("unused.exe"))
+        engine.start = Mock()
+        engine.process = Mock()
+        engine.process.stdout = io.StringIO(
+            "info depth 10 multipv 1 score cp -450 pv d8c8 a7c8\n"
+            "info depth 11 multipv 1 score cp -460 pv d8c8 a7c8\n"
+            "info depth 12 multipv 1 score cp -469 pv d8c8 a7c8\n"
+            "info depth 13 multipv 1 score cp -440 upperbound pv a6a5\n"
+            "bestmove d8c8 ponder a7c8\n"
+        )
+        engine.process.stdin = io.StringIO()
+        search = engine.analyse("test", 500, 1)
+        self.assertEqual(search.bestmove, "d8c8")
+        self.assertEqual(search.ponder, "a7c8")
+        self.assertEqual(search.completed_depth, 12)
+        self.assertEqual(search.lines[0].best_move, "d8c8")
+        self.assertTrue(search.trusted)
+        self.assertEqual(search.root_stability, 3)
+
+    def test_engine_rejects_mixed_or_incomplete_multipv_depth(self):
+        engine = PikafishEngine(Path("unused.exe"))
+        engine.start = Mock()
+        engine.process = Mock()
+        engine.process.stdout = io.StringIO(
+            "info depth 10 multipv 1 score cp 50 pv a0a1\n"
+            "info depth 10 multipv 2 score cp 40 pv a0a2\n"
+            "info depth 11 multipv 1 score cp 55 pv a0a1\n"
+            "bestmove a0a1\n"
+        )
+        engine.process.stdin = io.StringIO()
+        search = engine.analyse("test", 500, 2)
+        self.assertEqual(search.completed_depth, 10)
+        self.assertEqual([line.best_move for line in search.lines], ["a0a1", "a0a2"])
+        self.assertTrue(search.trusted)
+
+    def test_final_bestmove_mismatch_uses_latest_complete_pv_and_is_untrusted(self):
+        engine = PikafishEngine(Path("unused.exe"))
+        engine.start = Mock()
+        engine.process = Mock()
+        engine.process.stdout = io.StringIO(
+            "info depth 11 multipv 1 score cp 30 pv a0a1\n"
+            "info depth 12 multipv 1 score cp 45 pv a0a2\n"
+            "bestmove a0a1\n"
+        )
+        engine.process.stdin = io.StringIO()
+        search = engine.analyse("test", 500, 1)
+        self.assertEqual(search.completed_depth, 12)
+        self.assertEqual(search.lines[0].best_move, "a0a2")
+        self.assertEqual(search.bestmove, "a0a1")
+        self.assertFalse(search.trusted)
+        self.assertEqual(search.trust_reason, "bestmove_pv_mismatch")
+
+    def test_searchmoves_is_forwarded_to_uci(self):
+        engine = PikafishEngine(Path("unused.exe"))
+        engine.start = Mock()
+        engine.process = Mock()
+        engine.process.stdout = io.StringIO(
+            "info depth 10 multipv 1 score cp 10 pv a0a1\n"
+            "bestmove a0a1\n"
+        )
+        engine.process.stdin = io.StringIO()
+        engine.analyse("test", 500, 1, root_moves=["a0a1", "a0a2"])
+        self.assertIn(
+            "go movetime 500 searchmoves a0a1 a0a2",
+            engine.process.stdin.getvalue(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

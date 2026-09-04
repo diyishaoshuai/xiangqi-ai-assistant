@@ -7,7 +7,9 @@ import subprocess
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator, Sequence
 
 from core import AnalysisLine
 
@@ -17,11 +19,38 @@ INFO_RE = re.compile(
     r"\bscore (?P<score_type>cp|mate) (?P<score>-?\d+).*?\bpv (?P<pv>.+)$"
 )
 WDL_RE = re.compile(r"\bwdl (?P<win>\d+) (?P<draw>\d+) (?P<loss>\d+)\b")
+MOVE_RE = re.compile(r"^[a-i][0-9][a-i][0-9]$")
 LOGGER = logging.getLogger("xiangqi_ai.engine")
 
 
 class EngineError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class EngineSearchResult:
+    """One internally consistent, completed UCI search result.
+
+    Iteration support deliberately preserves the historic ``lines, bestmove =``
+    call pattern while callers migrate to the richer metadata.
+    """
+
+    lines: list[AnalysisLine]
+    bestmove: str
+    ponder: str | None
+    completed_depth: int
+    root_stability: int
+    trusted: bool
+    trust_reason: str
+    elapsed_ms: float
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.lines
+        yield self.bestmove
+
+    @property
+    def primary(self) -> AnalysisLine | None:
+        return self.lines[0] if self.lines else None
 
 
 class PikafishEngine:
@@ -108,8 +137,9 @@ class PikafishEngine:
         *,
         history_fen: str | None = None,
         moves: list[str] | tuple[str, ...] | None = None,
+        root_moves: Sequence[str] | None = None,
         cancelled=None,
-    ) -> tuple[list[AnalysisLine], str]:
+    ) -> EngineSearchResult:
         with self._search_lock:
             if cancelled is not None and cancelled():
                 raise InterruptedError("搜索已取消")
@@ -119,12 +149,13 @@ class PikafishEngine:
             started = time.monotonic()
             move_history = list(moves or ())
             LOGGER.info(
-                "analysis start fen=%s history_fen=%s moves=%s movetime_ms=%s multipv=%s",
+                "analysis start fen=%s history_fen=%s moves=%s movetime_ms=%s multipv=%s root_moves=%s",
                 fen,
                 history_fen or fen,
                 " ".join(move_history) or "-",
                 movetime_ms,
                 multipv,
+                " ".join(root_moves or ()) or "-",
             )
             self._send(f"setoption name MultiPV value {multipv}")
             position_command = f"position fen {history_fen or fen}"
@@ -133,7 +164,13 @@ class PikafishEngine:
             self._send(position_command)
             if cancelled is not None and cancelled():
                 raise InterruptedError("搜索已取消")
-            self._send(f"go movetime {movetime_ms}")
+            normalized_root_moves = tuple(move.lower() for move in (root_moves or ()))
+            if any(not MOVE_RE.fullmatch(move) for move in normalized_root_moves):
+                raise EngineError("受限搜索包含无效着法")
+            go_command = f"go movetime {movetime_ms}"
+            if normalized_root_moves:
+                go_command += " searchmoves " + " ".join(normalized_root_moves)
+            self._send(go_command)
             # Cover stop arriving immediately before/while sending 'go'. Drain
             # that search's bestmove before releasing the shared engine lock.
             stop_sent = cancelled is not None and cancelled()
@@ -142,8 +179,9 @@ class PikafishEngine:
             process = self.process
             if not process or not process.stdout:
                 raise EngineError("引擎尚未启动")
-            latest: dict[int, AnalysisLine] = {}
+            iterations: dict[int, dict[int, tuple[AnalysisLine, str | None]]] = {}
             bestmove = ""
+            ponder = None
             output_tail: deque[str] = deque(maxlen=12)
             last_depth_log = -float("inf")
             while True:
@@ -188,29 +226,105 @@ class PikafishEngine:
                         pv=match.group("pv").split(),
                         wdl=wdl,
                     )
-                    latest[item.multipv] = item
+                    bound = (
+                        "lowerbound" if " lowerbound " in f" {clean} "
+                        else "upperbound" if " upperbound " in f" {clean} "
+                        else None
+                    )
+                    iterations.setdefault(item.depth, {})[item.multipv] = (item, bound)
                 if clean.startswith("bestmove "):
                     parts = clean.split()
                     bestmove = parts[1] if len(parts) > 1 else ""
+                    if len(parts) >= 4 and parts[2] == "ponder":
+                        ponder = parts[3]
                     break
             if cancelled is not None and cancelled():
                 raise InterruptedError("搜索已取消")
-            result = [latest[key] for key in sorted(latest)]
-            if result:
-                top = result[0]
+            chosen_depth = 0
+            chosen_bucket: dict[int, tuple[AnalysisLine, str | None]] = {}
+            requested_count = max(1, int(multipv))
+            complete_depths = [
+                depth for depth, bucket in iterations.items()
+                if all(index in bucket and bucket[index][1] is None
+                        for index in range(1, requested_count + 1))
+            ]
+            exact_primary_depths = [
+                depth for depth, bucket in iterations.items()
+                if 1 in bucket
+                and bucket[1][1] is None
+            ]
+            primary_depths = [
+                depth for depth, bucket in iterations.items() if 1 in bucket
+            ]
+            # The executable score/PV must come from the latest completed
+            # iteration, even when the engine's trailing bestmove disagrees.
+            # That disagreement is retained below as an explicit trust failure
+            # so automatic play can verify and then fall back to this PV.
+            if complete_depths:
+                chosen_depth = max(complete_depths)
+            elif exact_primary_depths:
+                chosen_depth = max(exact_primary_depths)
+            elif primary_depths:
+                chosen_depth = max(primary_depths)
+            elif iterations:
+                chosen_depth = max(iterations)
+            if chosen_depth:
+                chosen_bucket = iterations[chosen_depth]
+            lines = [chosen_bucket[key][0] for key in sorted(chosen_bucket)]
+            exact_bucket = bool(chosen_bucket) and all(bound is None for _, bound in chosen_bucket.values())
+            best_matches = bool(lines) and lines[0].best_move == bestmove
+            requested_complete = len(lines) >= requested_count
+            trusted = bool(bestmove and bestmove != "(none)" and best_matches and exact_bucket
+                           and (requested_complete or int(multipv) == 1))
+            if trusted:
+                trust_reason = "complete_iteration"
+            elif not best_matches:
+                trust_reason = "bestmove_pv_mismatch"
+            elif not exact_bucket:
+                trust_reason = "bound_or_partial_iteration"
+            else:
+                trust_reason = "incomplete_multipv_iteration"
+
+            stability = 0
+            for depth in sorted(iterations, reverse=True):
+                bucket = iterations[depth]
+                if 1 not in bucket or bucket[1][1] is not None:
+                    continue
+                if bucket[1][0].best_move != bestmove:
+                    break
+                stability += 1
+
+            elapsed_ms = (time.monotonic() - started) * 1000
+            result = EngineSearchResult(
+                lines,
+                bestmove,
+                ponder,
+                chosen_depth,
+                stability,
+                trusted,
+                trust_reason,
+                elapsed_ms,
+            )
+            if lines:
+                top = lines[0]
                 LOGGER.info(
-                    "analysis done bestmove=%s depth=%s score=%s:%s wdl=%s elapsed_ms=%.1f budget_ms=%s",
+                    "analysis done bestmove=%s ponder=%s depth=%s score=%s:%s wdl=%s "
+                    "stability=%s trusted=%s trust_reason=%s elapsed_ms=%.1f budget_ms=%s",
                     bestmove,
+                    ponder,
                     top.depth,
                     top.score_type,
                     top.score,
                     top.wdl,
-                    (time.monotonic() - started) * 1000,
+                    stability,
+                    trusted,
+                    trust_reason,
+                    elapsed_ms,
                     movetime_ms,
                 )
             else:
                 LOGGER.info("analysis done bestmove=%s no analysis lines", bestmove)
-            return result, bestmove
+            return result
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:

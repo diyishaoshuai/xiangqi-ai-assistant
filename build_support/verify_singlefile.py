@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 FUNCTION_FLAGS = ["--engine-self-test", "--no-win-engine-self-test", "--anti-loop-engine-self-test",
-                  "--anti-check-policy-self-test", "--outcome-guard-self-test", "--auto-analysis-self-test",
+                  "--anti-check-policy-self-test", "--move-safety-self-test", "--outcome-guard-self-test", "--auto-analysis-self-test",
                   "--follow-best-self-test", "--follow-recovery-self-test", "--topmost-self-test",
                   "--orientation-self-test", "--direct-king-capture-self-test", "--help-self-test",
                   "--automation-self-test", "--ui-self-test"]
