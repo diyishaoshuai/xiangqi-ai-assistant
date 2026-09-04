@@ -15,6 +15,13 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 GA_ROOT = 2
 
+# ONNX occasionally changes several unrelated labels while JJ Xiangqi is
+# painting selection glows, move trails, clocks, or the last-move marker.  The
+# commanded move's two endpoints are much stronger evidence than those
+# unrelated squares.  Keep a finite cap so an overlay/new board is never
+# mistaken for the old transaction.
+CLICK_ENDPOINT_MAX_MISMATCHES = 4
+
 
 class AutomationState(str, Enum):
     IDLE = "idle"
@@ -474,20 +481,36 @@ def classify_click_confirmation(
     if observed == expected:
         return ClickConfirmation(ConfirmationKind.EXPECTED, board=dict(expected))
     expected_mismatches = _board_mismatch_count(expected, observed)
+    before_mismatches = _board_mismatch_count(before, observed)
     changed_sources = [
         square for square, piece in before.items()
         if expected.get(square) != piece and expected.get(square) is None
     ]
-    if (
-        expected_mismatches <= 1
-        and len(changed_sources) == 1
-        and observed.get(changed_sources[0]) is None
-    ):
-        return ClickConfirmation(
-            ConfirmationKind.EXPECTED,
-            board=dict(expected),
-            mismatches=expected_mismatches,
-        )
+    changed_destinations = [
+        square for square, piece in expected.items()
+        if before.get(square) != piece and piece is not None
+    ]
+    endpoints_are_known = (
+        len(changed_sources) == 1 and len(changed_destinations) == 1
+    )
+    source = changed_sources[0] if endpoints_are_known else None
+    destination = changed_destinations[0] if endpoints_are_known else None
+    unrelated_squares = (before.keys() | expected.keys() | observed.keys()) - {
+        source,
+        destination,
+    }
+    unrelated_occupancy_changes = sum(
+        (expected.get(square) is None) != (observed.get(square) is None)
+        for square in unrelated_squares
+    )
+    before_unrelated_occupancy_changes = sum(
+        (before.get(square) is None) != (observed.get(square) is None)
+        for square in unrelated_squares
+    )
+    # Prefer a uniquely legal opponent reply over endpoint-only repair.  The
+    # commanded piece normally remains at its destination while the opponent
+    # moves two other endpoints, so checking endpoint evidence first would
+    # incorrectly erase a fast reply as classifier noise.
     transition = classify_board_transition(expected, observed, opponent_side)
     if transition.kind == TransitionKind.MOVE:
         return ClickConfirmation(
@@ -502,6 +525,60 @@ def classify_click_confirmation(
             transition.move,
             transition.board,
             transition.mismatches,
+        )
+    # Do not erase a coherent two-ply change as harmless classifier noise.  It
+    # can happen when the opponent replies and the user manually moves before
+    # the confirmation frame arrives.  The worker will relock instead of
+    # guessing whose action should own that state.
+    multi_ply = project_legal_path(
+        expected,
+        observed,
+        opponent_side,
+        max_plies=2,
+        max_mismatches=0,
+    )
+    if multi_ply is not None and len(multi_ply.moves) == 2:
+        return ClickConfirmation(ConfirmationKind.AMBIGUOUS)
+    # Exact endpoint agreement proves the commanded piece left its source and
+    # reached its destination.  Repair a handful of unrelated animation/glow
+    # errors to the canonical legal board instead of timing out the takeover.
+    if (
+        endpoints_are_known
+        and expected_mismatches <= CLICK_ENDPOINT_MAX_MISMATCHES
+        and unrelated_occupancy_changes <= 1
+        and observed.get(source) == expected.get(source)
+        and observed.get(destination) == expected.get(destination)
+    ):
+        return ClickConfirmation(
+            ConfirmationKind.EXPECTED,
+            board=dict(expected),
+            mismatches=expected_mismatches,
+        )
+    if (
+        expected_mismatches <= 1
+        and len(changed_sources) == 1
+        and observed.get(changed_sources[0]) is None
+    ):
+        return ClickConfirmation(
+            ConfirmationKind.EXPECTED,
+            board=dict(expected),
+            mismatches=expected_mismatches,
+        )
+    # A selected-piece glow can alter one unrelated classifier label even when
+    # the actual move never left its source.  Endpoint agreement is strong
+    # enough to call this unchanged, allowing one safe retry after two fresh
+    # observations instead of abandoning the whole takeover session.
+    if (
+        before_mismatches <= CLICK_ENDPOINT_MAX_MISMATCHES
+        and endpoints_are_known
+        and before_unrelated_occupancy_changes <= 1
+        and observed.get(source) == before.get(source)
+        and observed.get(destination) == before.get(destination)
+    ):
+        return ClickConfirmation(
+            ConfirmationKind.UNCHANGED,
+            board=dict(before),
+            mismatches=before_mismatches,
         )
     return ClickConfirmation(ConfirmationKind.AMBIGUOUS)
 

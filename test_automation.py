@@ -152,6 +152,70 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(confirmation.board, expected)
         self.assertEqual(confirmation.mismatches, 1)
 
+    def test_click_confirmation_repairs_one_noisy_unchanged_square(self):
+        before, _ = parse_fen(
+            "4k4/9/9/9/4P4/9/9/9/4R4/4K4 w - - 0 1"
+        )
+        expected = apply_move(before, "e1f1")
+        observed = dict(before)
+        observed[(4, 5)] = "C"  # unrelated glow/classifier error
+        confirmation = classify_click_confirmation(before, expected, observed, "b")
+        self.assertEqual(confirmation.kind, ConfirmationKind.UNCHANGED)
+        self.assertEqual(confirmation.board, before)
+        self.assertEqual(confirmation.mismatches, 1)
+
+    def test_click_confirmation_trusts_exact_endpoints_with_four_unrelated_errors(self):
+        before, _ = parse_fen(
+            "4k4/9/9/9/4P4/9/2P3P2/9/4R4/4K4 w - - 0 1"
+        )
+        expected = apply_move(before, "e1f1")
+        noisy_expected = dict(expected)
+        noisy_expected[(4, 5)] = "C"
+        noisy_expected[(2, 3)] = "N"
+        noisy_expected[(6, 3)] = "B"
+        noisy_expected[(4, 9)] = "a"
+        confirmation = classify_click_confirmation(
+            before, expected, noisy_expected, "b"
+        )
+        self.assertEqual(confirmation.kind, ConfirmationKind.EXPECTED)
+        self.assertEqual(confirmation.board, expected)
+        self.assertEqual(confirmation.mismatches, 4)
+
+    def test_click_confirmation_trusts_unchanged_endpoints_with_four_unrelated_errors(self):
+        before, _ = parse_fen(
+            "4k4/9/9/9/4P4/9/2P3P2/9/4R4/4K4 w - - 0 1"
+        )
+        expected = apply_move(before, "e1f1")
+        noisy_before = dict(before)
+        noisy_before[(4, 5)] = "C"
+        noisy_before[(2, 3)] = "N"
+        noisy_before[(6, 3)] = "B"
+        noisy_before[(4, 9)] = "a"
+        confirmation = classify_click_confirmation(
+            before, expected, noisy_before, "b"
+        )
+        self.assertEqual(confirmation.kind, ConfirmationKind.UNCHANGED)
+        self.assertEqual(confirmation.board, before)
+        self.assertEqual(confirmation.mismatches, 4)
+
+    def test_click_confirmation_rejects_endpoint_match_with_too_many_errors(self):
+        before, _ = parse_fen(
+            "4k4/9/9/9/4P4/9/2P3P2/9/4R4/4K4 w - - 0 1"
+        )
+        expected = apply_move(before, "e1f1")
+        noisy_before = dict(before)
+        for square, piece in (
+            ((4, 5), "C"), ((2, 3), "N"), ((6, 3), "B"),
+            ((4, 9), "a"), ((0, 0), "R"),
+        ):
+            noisy_before[square] = piece
+        self.assertEqual(
+            classify_click_confirmation(
+                before, expected, noisy_before, "b"
+            ).kind,
+            ConfirmationKind.AMBIGUOUS,
+        )
+
     def test_fast_reply_keeps_commanded_capture_when_old_target_glyph_lingers(self):
         before, _ = parse_fen(
             "2bakabnr/9/c1n4c1/p3p1p1p/2p6/1r4P2/"

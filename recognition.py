@@ -88,11 +88,24 @@ class BoardGeometry:
         return source_x, source_y
 
     def point_for_piece(self, square: tuple[int, int]) -> tuple[float, float]:
-        """Return the detected disc centre, falling back to its intersection."""
+        """Return a trustworthy detected disc centre or its intersection.
+
+        A real piece centre is the best source-click target, but circle fitting
+        can occasionally lock onto a highlight or nearby ornament.  Reject
+        centres displaced far from the intersection.  JJ's selection glow can
+        otherwise be mistaken for the disc centre and turn a valid move into
+        a click on the edge of the source square.
+        """
+        intersection = self.point_for_square(square)
+        adjacent = (1, 0) if square[0] < 8 else (-1, 0)
+        neighbour = self.point_for_square((square[0] + adjacent[0], square[1]))
+        grid_step = math.dist(intersection, neighbour)
+        maximum_offset = max(4.0, min(12.0, grid_step * 0.12))
         for x, rank, center_x, center_y in self.piece_centers:
             if (x, rank) == square:
-                return center_x, center_y
-        return self.point_for_square(square)
+                candidate = (center_x, center_y)
+                return candidate if math.dist(candidate, intersection) <= maximum_offset else intersection
+        return intersection
 
 
 def _feature(patch: Image.Image, red: bool) -> list[float]:
@@ -756,7 +769,8 @@ class NeuralBoardRecognizer:
 
     def recognize(self, image: Image.Image, *, geometry_hint=None,
                   minimum_geometry_confidence: float = 0.0,
-                  cancelled=None) -> tuple[Image.Image, list[Detection]]:
+                  cancelled=None,
+                  tracking_only: bool = False) -> tuple[Image.Image, list[Detection]]:
         def check_cancelled():
             if cancelled is not None and cancelled():
                 raise InterruptedError("用户已停止自动接管")
@@ -777,7 +791,7 @@ class NeuralBoardRecognizer:
         best = None
         errors: list[str] = []
         primary_bboxes = self._candidate_bboxes(frame_height, frame_width)
-        bboxes = list(primary_bboxes)
+        bboxes = [] if tracking_only else list(primary_bboxes)
         hint_bbox = self._hint_bbox(geometry_hint, image.size)
         if hint_bbox is not None:
             bboxes.insert(0, hint_bbox)
@@ -786,8 +800,11 @@ class NeuralBoardRecognizer:
             previous_bbox = getattr(self, "last_search_bbox", None)
             if previous_bbox is not None and getattr(self, "last_image_size", None) == image.size:
                 bboxes.insert(0, list(previous_bbox))
-        bboxes.extend(self._tiled_candidate_bboxes(frame_height, frame_width))
+        if not tracking_only:
+            bboxes.extend(self._tiled_candidate_bboxes(frame_height, frame_width))
         bboxes = [list(item) for item in dict.fromkeys(tuple(bbox) for bbox in bboxes)]
+        if tracking_only and not bboxes:
+            raise RuntimeError("没有可用于动画确认的已锁定棋盘区域")
         for bbox in bboxes:
             try:
                 check_cancelled()
@@ -966,12 +983,15 @@ class PieceRecognizer:
 
     def recognize(self, image: Image.Image, *, geometry_hint=None,
                   minimum_geometry_confidence: float = 0.0,
-                  cancelled=None) -> tuple[Image.Image, list[Detection]]:
+                  cancelled=None,
+                  tracking_only: bool = False) -> tuple[Image.Image, list[Detection]]:
+        previous_geometry = self.last_geometry
         try:
             result = self._ensure_neural().recognize(
                 image, geometry_hint=geometry_hint,
                 minimum_geometry_confidence=minimum_geometry_confidence,
                 cancelled=cancelled,
+                tracking_only=tracking_only,
             )
             self.last_backend = "onnx"
             self.last_error = ""
@@ -982,7 +1002,7 @@ class PieceRecognizer:
         except Exception as exc:
             self.last_backend = "template-fallback"
             self.last_error = str(exc)
-            self.last_geometry = None
+            self.last_geometry = previous_geometry if tracking_only else None
             if cancelled is not None:
                 # Automation requires ONNX. Slow template fallback can never pass
                 # its safety gate and must not delay the emergency stop.

@@ -1,3 +1,4 @@
+import math
 import unittest
 import threading
 from unittest.mock import Mock
@@ -119,6 +120,39 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(recognizer.classifier.pred.call_count, 1)
         self.assertAlmostEqual(recognizer.last_geometry.confidence, .4)
 
+    def test_animation_tracking_never_expands_to_full_screen_tiles(self):
+        import numpy as np
+        recognizer = object.__new__(NeuralBoardRecognizer)
+        keypoints = np.float32([[50, 50], [400, 50], [50, 450], [400, 450]])
+        recognizer.pose = Mock()
+        recognizer.pose.pred.return_value = keypoints, np.full(4, .8)
+        rows = [["."] * 9 for _ in range(10)]
+        rows[0][4], rows[9][4] = "k", "K"
+        recognizer.classifier = Mock()
+        recognizer.classifier.pred.return_value = (
+            None,
+            rows,
+            np.full((10, 9), .99),
+            "test",
+        )
+        recognizer.last_search_bbox = (0, 0, 500, 500)
+        recognizer.last_image_size = (500, 500)
+        recognizer.tracking_failures = 0
+        hint = BoardGeometry(
+            (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            False,
+            .8,
+            (500, 500),
+        )
+        recognizer.recognize(
+            Image.new("RGB", (500, 500)),
+            geometry_hint=hint,
+            minimum_geometry_confidence=.1,
+            tracking_only=True,
+        )
+        self.assertEqual(recognizer.last_timings["regions"], 1)
+        recognizer.pose.pred.assert_called_once()
+
     def test_geometry_maps_both_board_orientations(self):
         identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         normal = BoardGeometry(identity, False, 1.0, (500, 500))
@@ -140,6 +174,39 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(
             geometry.point_for_piece((3, 0)),
             geometry.point_for_square((3, 0)),
+        )
+
+    def test_piece_click_rejects_implausibly_displaced_disc_center(self):
+        geometry = BoardGeometry(
+            (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            False,
+            1.0,
+            (500, 500),
+            ((4, 0, 260.0, 480.0),),
+        )
+        self.assertEqual(
+            geometry.point_for_piece((4, 0)),
+            geometry.point_for_square((4, 0)),
+        )
+
+    def test_piece_click_rejects_twenty_pixel_offset_on_large_board(self):
+        geometry = BoardGeometry(
+            (2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0),
+            False,
+            1.0,
+            (1000, 1000),
+            ((4, 0, 470.9, 900.0),),
+        )
+        self.assertAlmostEqual(
+            math.dist(
+                geometry.point_for_square((4, 0)),
+                (470.9, 900.0),
+            ),
+            20.9,
+        )
+        self.assertEqual(
+            geometry.point_for_piece((4, 0)),
+            geometry.point_for_square((4, 0)),
         )
 
     def test_fast_geometry_refresh_runs_pose_without_full_classifier(self):
