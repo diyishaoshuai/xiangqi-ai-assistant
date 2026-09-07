@@ -2499,13 +2499,6 @@ class XiangqiApp:
             current = None
             if not force_full_relock:
                 current = self._capture_unchanged_click_board(session_id, stop_event, board)
-            fast_capture = getattr(self, "_capture_fast_click_board", None)
-            if current is None and not force_full_relock and callable(fast_capture):
-                current = fast_capture(
-                    session_id,
-                    stop_event,
-                    board,
-                )
             if current is None:
                 try:
                     current = self._capture_stable_mouse_board(
@@ -2517,16 +2510,12 @@ class XiangqiApp:
                         status="画面发生变化，点击前正在重新确认棋盘",
                     )
                 except TimeoutError:
-                    if not force_full_relock or not callable(fast_capture):
-                        raise
                     self._queue_mouse_status(
                         session_id,
                         AutomationState.WAITING_BOARD,
-                        "选中光效干扰完整识别，改用新帧网格坐标立即重试；F1 急停",
+                        "画面尚未通过全盘核对，继续等待清晰画面；F1 急停",
                     )
-                    current = fast_capture(session_id, stop_event, board)
-                    if current is None:
-                        continue
+                    continue
             candidate = current[0]
             if candidate == board:
                 if (
@@ -2544,24 +2533,16 @@ class XiangqiApp:
                 standard_board,
             ):
                 return "new_game", current
-            if force_full_relock and callable(fast_capture):
-                # Selection glows and move hints can alter classifier labels even
-                # though the physical board has not changed.  A fresh pose-only
-                # lock is sufficient for a bounded retry because the move itself
-                # was already calculated from a previously confirmed position.
-                fallback = fast_capture(session_id, stop_event, board)
-                if fallback is not None:
-                    self._queue_mouse_status(
-                        session_id,
-                        AutomationState.WAITING_BOARD,
-                        "盘面受选中光效干扰，已重新锁定十字坐标并继续重试；F1 急停",
-                    )
-                    return "ready", fallback
             self._queue_mouse_status(
                 session_id,
                 AutomationState.WAITING_BOARD,
-                "盘面与思考前不一致，已暂停点击并等待安全重锁；F1 急停",
+                "盘面与思考前不一致，已作废旧着法并重新核对历史；F1 急停",
             )
+            self.logger.warning(
+                "preclick board mismatch session=%s expected=%s observed=%s",
+                session_id, make_fen(board, "w"), make_fen(candidate, "w"),
+            )
+            return "changed", current
 
     def _restricted_autoplay_moves(
         self,
@@ -3228,6 +3209,37 @@ class XiangqiApp:
                         force_full_relock=click_attempts > 0,
                     )
                     fresh_board, grid, geometry = fresh
+                    if ready_kind == "changed":
+                        # No click has been sent: an opponent animation may
+                        # have been mistaken for its final legal destination.
+                        from autoplay_state import reconcile_last_opponent_move
+
+                        corrected = None if transaction.destination_send_count else reconcile_last_opponent_move(
+                            history_fen, move_history, fresh_board, current_side,
+                        )
+                        if corrected is None:
+                            self._queue_mouse_status(
+                                session_id, AutomationState.WAITING_BOARD,
+                                "盘面不同步且暂不能合法衔接，暂停落子并继续核对；F1 急停",
+                            )
+                            self._mouse_sleep(session_id, stop_event, 0.30)
+                            continue
+                        move_history = corrected
+                        board = dict(fresh_board)
+                        self.mouse_auto_transaction = None
+                        prefetch.cancel()
+                        visits.clear()
+                        used_moves.clear()
+                        consecutive_checks = 0
+                        self._queue_mouse_board(
+                            session_id, board, current_side, grid, history_fen,
+                            move_history, "已修正对手动画造成的局面偏差，重新计算着法",
+                        )
+                        self.logger.warning(
+                            "preclick history repaired session=%s moves=%s",
+                            session_id, " ".join(move_history),
+                        )
+                        break
                     if ready_kind == "new_game":
                         new_game_adopted = adopt_new_game(
                             fresh_board,

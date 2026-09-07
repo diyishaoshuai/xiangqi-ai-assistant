@@ -84,7 +84,7 @@ class PixelProofTests(unittest.TestCase):
         app._capture_stable_mouse_board.assert_called_once()
         self.assertEqual(app._capture_stable_mouse_board.call_args.kwargs["stable_frames"], 3)
 
-    def test_changed_pixels_use_pose_only_before_full_classifier_fallback(self):
+    def test_changed_pixels_never_use_pose_as_board_proof(self):
         app = self.make_app()
         image = self.image.copy()
         image.putpixel((300, 300), (0, 0, 0))
@@ -102,9 +102,9 @@ class PixelProofTests(unittest.TestCase):
                 7, app.mouse_auto_stop_event, 42, self.board, {}, {},
             )
         self.assertEqual(kind, "ready")
-        self.assertIs(current[2], refreshed)
-        app.recognizer.refresh_geometry.assert_called_once()
-        app._capture_stable_mouse_board.assert_not_called()
+        self.assertIs(current[2], self.geometry)
+        app.recognizer.refresh_geometry.assert_not_called()
+        app._capture_stable_mouse_board.assert_called_once()
 
     def test_cancel_arriving_during_fast_screenshot_never_returns_click_ready(self):
         app = self.make_app()
@@ -115,6 +115,18 @@ class PixelProofTests(unittest.TestCase):
 
         with patch("app.ImageGrab.grab", side_effect=grab), self.assertRaises(InterruptedError):
             app._capture_unchanged_click_board(7, app.mouse_auto_stop_event, self.board)
+
+    def test_stable_different_board_invalidates_precomputed_move(self):
+        app = self.make_app()
+        changed = {**self.board, (0, 0): "c"}
+        image = self.image.copy()
+        image.putpixel((300, 300), (0, 0, 0))
+        app._capture_stable_mouse_board.return_value = (changed, "grid", self.geometry)
+        with patch("app.ImageGrab.grab", return_value=image), patch("app.foreground_window", return_value=42), patch("app.user_input_is_idle", return_value=True):
+            kind, current = app._wait_for_click_ready(7, app.mouse_auto_stop_event, 42, self.board, {}, {})
+        self.assertEqual(kind, "changed")
+        self.assertEqual(current[0], changed)
+        app.recognizer.refresh_geometry.assert_not_called()
 
     def test_user_activity_is_not_bypassed_by_fast_pixel_proof(self):
         app = self.make_app()

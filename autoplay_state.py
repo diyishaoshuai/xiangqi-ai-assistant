@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from app_paths import user_data_dir
-from automation import move_is_legal
+from automation import move_is_legal, legal_successors
 from core import apply_move, make_fen, parse_fen
 
 
@@ -53,6 +53,21 @@ class AutoplayState:
 
 def state_path() -> Path:
     return user_data_dir() / "autoplay-state.json"
+
+
+def reconcile_last_opponent_move(history_fen, moves, observed, our_side):
+    """Replace only the last opponent ply, using an exact visual legal match."""
+    if not moves:
+        return None
+    try:
+        before, turn = _replay(history_fen, tuple(moves[:-1]))
+    except (ValueError, TypeError):
+        return None
+    if turn == our_side:
+        return None
+    matches = [move for move, board in legal_successors(before, turn)
+               if board == observed]
+    return [*moves[:-1], matches[0]] if len(matches) == 1 else None
 
 
 def _valid_side(value) -> bool:

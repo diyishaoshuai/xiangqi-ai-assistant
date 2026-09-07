@@ -5,11 +5,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from autoplay_state import load_autoplay_state, save_autoplay_state
+from autoplay_state import load_autoplay_state, save_autoplay_state, reconcile_last_opponent_move
 from core import START_FEN, apply_move, parse_fen
 
 
 class AutoplayStateTests(unittest.TestCase):
+    def test_animation_intermediate_opponent_square_can_be_corrected(self):
+        fen = "1rbaka2r/4n4/1cn1b4/p1R1p1Ncp/2p6/6p2/P1P1P3P/2N1C1C2/9/2BAKAB1R b - - 0 1"
+        board, _ = parse_fen(fen)
+        observed = apply_move(board, "h6h3")
+        self.assertEqual(reconcile_last_opponent_move(fen, ["h6h5"], observed, "w"), ["h6h3"])
+        observed.pop((2, 3))
+        self.assertIsNone(reconcile_last_opponent_move(fen, ["h6h5"], observed, "w"))
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

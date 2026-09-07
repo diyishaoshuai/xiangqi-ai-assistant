@@ -315,13 +315,13 @@ class AutoplayFlowTests(unittest.TestCase):
             2,
         )
 
-    def test_click_retry_falls_back_to_fresh_pose_when_selection_glow_blocks_classifier(self):
+    def test_click_retry_waits_for_full_board_after_selection_glow(self):
         board = {(4, 9): "k", (4, 0): "K", (7, 0): "N"}
         geometry = object()
         harness = ClickReadyHarness(None)
         harness._capture_unchanged_click_board = Mock()
         harness._capture_stable_mouse_board = Mock(
-            side_effect=TimeoutError("选中光效")
+            side_effect=[TimeoutError("选中光效"), (board, "grid", geometry)]
         )
         harness._capture_fast_click_board = Mock(
             return_value=(board, "grid", geometry)
@@ -342,7 +342,8 @@ class AutoplayFlowTests(unittest.TestCase):
             )
         self.assertEqual(kind, "ready")
         self.assertEqual(result, (board, "grid", geometry))
-        harness._capture_fast_click_board.assert_called_once()
+        harness._capture_fast_click_board.assert_not_called()
+        self.assertEqual(harness._capture_stable_mouse_board.call_count, 2)
 
 
 class AutoplayLifecycleTests(unittest.TestCase):
