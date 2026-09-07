@@ -1574,9 +1574,9 @@ class XiangqiApp:
                 "仅限单机残局、复盘或规则明确允许使用辅助的场景。\n"
                 "请勿用于真人匹配、排位或其他禁止辅助的对局。\n\n"
                 f"{player_description}；当前设置为{turn_name}走。\n"
-                "确认游戏棋盘完整显示在主屏幕上；启动后助手窗口会隐藏。\n\n"
+                "启动后助手窗口保持可见，请放在游戏棋盘旁边，避免遮挡棋盘。\n\n"
                 "用户操作鼠标或切换窗口时程序会暂停并自动恢复。\n"
-                "按 F1 可在任何时候急停并恢复助手窗口。",
+                "按 F1 可在任何时候急停。",
             )
             if not confirmed:
                 return
@@ -1646,7 +1646,6 @@ class XiangqiApp:
                     clear_autoplay_state()
                     self.logger.exception("discarded invalid persisted autoplay state")
         self.root.update_idletasks()
-        self.root.withdraw()
         worker = threading.Thread(
             target=self._mouse_autoplay_worker,
             args=(

@@ -232,7 +232,7 @@ class WorkspaceTests(unittest.TestCase):
                 app._poll_f1_hotkey()
         toggle.assert_called_once()
 
-    def test_f1_restores_real_tk_window_while_capture_is_still_blocked(self):
+    def test_f1_keeps_window_visible_and_stops_while_capture_is_blocked(self):
         import threading
         from automation import AutomationState
 
@@ -245,12 +245,13 @@ class WorkspaceTests(unittest.TestCase):
             app.result_queue.put(("mouse_done", (session_id, "silent", "stopped", "stopped")))
 
         app.mouse_auto_consent_confirmed = True
+        self.root.deiconify()
         with patch.object(app, "_mouse_autoplay_worker", side_effect=blocked_worker):
             app._start_mouse_autoplay()
             worker = app.mouse_auto_thread
             try:
                 self.assertTrue(entered.wait(1))
-                self.assertEqual(self.root.state(), "withdrawn")
+                self.assertEqual(self.root.state(), "normal")
                 app._on_global_f1()
                 self.root.after_cancel(app._hotkey_poll_after_id)
                 app._poll_f1_hotkey()
