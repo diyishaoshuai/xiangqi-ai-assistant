@@ -630,6 +630,16 @@ def foreground_window() -> int:
     return int(api.GetForegroundWindow() or 0)
 
 
+def window_process_id(window: int) -> int:
+    if not window or not hasattr(ctypes, "windll"):
+        return 0
+    process = ctypes.c_ulong()
+    api = ctypes.windll.user32
+    api.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    api.GetWindowThreadProcessId(window, ctypes.byref(process))
+    return int(process.value)
+
+
 def window_at_point(point: tuple[float, float]) -> int:
     if not hasattr(ctypes, "windll"):
         return 0

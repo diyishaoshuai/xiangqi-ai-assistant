@@ -98,6 +98,7 @@ from automation import (
     turn_for_new_game,
     user_input_is_idle,
     window_at_point,
+    window_process_id,
 )
 
 
@@ -293,6 +294,7 @@ class XiangqiApp:
         self.diagnostic_recorder = DiagnosticRecorder()
         self.move_decision_policy = MoveDecisionPolicy()
         self.autoplay_state_enabled = True
+        self.mouse_auto_own_pid = os.getpid()
         self.mouse_auto_last_observation: BoardObservation | None = None
         self.mouse_auto_platform_profile = select_platform_profile()
         self.mouse_auto_transaction: MoveTransaction | None = None
@@ -1809,6 +1811,12 @@ class XiangqiApp:
             if "找不到深度识别模型" in reason or "缺少 ONNX" in reason:
                 raise FatalAutomationError(reason)
             raise RuntimeError(f"本帧无法可靠定位棋盘：{reason}")
+        if getattr(self, "mouse_auto_own_pid", None) is not None:
+            if any(window_process_id(window_at_point(geometry.point_for_square(square))) == self.mouse_auto_own_pid
+                   for square in ((0, 0), (8, 0), (0, 9), (8, 9), (4, 4))):
+                if cache is not None:
+                    cache.clear()
+                raise RuntimeError("助手窗口覆盖了识别区域，请将助手移到游戏棋盘旁边")
         scores = getattr(
             getattr(getattr(self.recognizer, "neural", None), "classifier", None),
             "last_scores",
@@ -2774,6 +2782,11 @@ class XiangqiApp:
                         resume_state is not None
                         and resume_profile not in ("generic", self.mouse_auto_platform_profile.name)
                     ):
+                        if resume_state[4] is not None:
+                            self._queue_mouse_status(session_id, AutomationState.WAITING_BOARD,
+                                "上次落子待确认，请返回原游戏窗口；不会因切换窗口清除事务")
+                            self._mouse_sleep(session_id, stop_event, .75)
+                            continue
                         self.logger.warning(
                             "discarded autoplay state from different platform stored=%s current=%s",
                             resume_profile,

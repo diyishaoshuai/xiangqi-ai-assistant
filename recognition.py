@@ -613,7 +613,7 @@ class NeuralBoardRecognizer:
             for x in range(9)
             for rank in range(10)
         ]
-        margin = step * 0.65
+        margin = step * 1.5
         width, height = image.size
         left = max(0, math.floor(min(point[0] for point in all_points) - margin))
         top = max(0, math.floor(min(point[1] for point in all_points) - margin))
@@ -646,6 +646,33 @@ class NeuralBoardRecognizer:
             (left + float(x) / scale, top + float(y) / scale)
             for x, y, _radius in circles[0]
         ]
+        # Some JJ themes compress the pose prediction horizontally by almost
+        # one file. Use the ordered nine discs on BOTH intact back ranks as
+        # independent anchors; nearest-neighbour snapping alone misses this.
+        back_ranks = []
+        if all((file, rank) in board for rank in (0, 9) for file in range(9)):
+            for rank in (0, 9):
+                row_y = sum(geometry.point_for_square((file, rank))[1] for file in range(9)) / 9
+                row = sorted(center for center in candidates if abs(center[1] - row_y) < step * .35)
+                if len(row) != 9:
+                    break
+                gaps = [row[i + 1][0] - row[i][0] for i in range(8)]
+                median_gap = float(np.median(gaps))
+                if not step * .7 < median_gap < step * 1.35 or any(abs(gap - median_gap) > median_gap * .15 for gap in gaps):
+                    break
+                ordered = list(reversed(row)) if geometry.rotated else row
+                back_ranks.extend(((file, rank), point) for file, point in enumerate(ordered))
+        if len(back_ranks) == 18:
+            lattice, mask = cv2.findHomography(
+                np.float32([cls._normalized_square(square, geometry.rotated) for square, _ in back_ranks]),
+                np.float32([point for _, point in back_ranks]), cv2.RANSAC, max(2., step * .08),
+            )
+            if lattice is not None and mask is not None and int(mask.sum()) >= 16:
+                proposed = BoardGeometry(tuple(float(v) for v in lattice.reshape(-1)), geometry.rotated, geometry.confidence, geometry.image_size)
+                internal = [square for square in board if square[1] not in (0, 9)]
+                supported = sum(any(math.dist(proposed.point_for_square(square), center) < step * .18 for center in candidates) for square in internal)
+                if supported >= 6 and all(math.dist(geometry.point_for_square(square), proposed.point_for_square(square)) <= step * 1.5 for square, _ in back_ranks):
+                    geometry = proposed
         matches: dict[tuple[int, int], tuple[float, float]] = {}
         for square in board:
             projected = geometry.point_for_square(square)
@@ -925,6 +952,16 @@ class NeuralBoardRecognizer:
             self.last_geometry,
             board,
         )
+        # The visible background and physical click grid must share the same
+        # calibrated transform (the old background retained the raw pose).
+        aligned = cv2.warpPerspective(
+            np.asarray(image.convert("RGB")),
+            np.linalg.inv(np.array(self.last_geometry.inverse_matrix).reshape(3, 3)),
+            (450, 500),
+        )
+        grid = Image.fromarray(aligned).crop((50, 50, 400, 450))
+        if rotate:
+            grid = grid.transpose(Image.Transpose.ROTATE_180)
         self.last_timings["circle_refine_ms"] = round(
             (time.perf_counter() - circle_started) * 1000,
             1,
