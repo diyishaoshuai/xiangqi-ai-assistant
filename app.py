@@ -2226,6 +2226,7 @@ class XiangqiApp:
         stop_event: threading.Event,
         *,
         stable_frames: int = 2,
+        opponent_anchor=None,
         allow_terminal: bool = False,
         accept=None,
         on_candidate=None,
@@ -2266,6 +2267,8 @@ class XiangqiApp:
             )
 
         tracker = StableBoardTracker(stable_frames)
+        if opponent_anchor is not None:
+            tracker.minimum_seconds = .45
         wait_started = time.monotonic()
         latest = None
         last_detail = ""
@@ -2310,7 +2313,19 @@ class XiangqiApp:
                     **capture_options,
                 )
                 candidate = current[0]
-                if accept is not None and not accept(candidate):
+                observation = getattr(self, "mouse_auto_last_observation", None)
+                moving = False
+                if opponent_anchor is not None and observation is not None and observation.geometry is current[2]:
+                    endpoints = {square for square in opponent_anchor.keys() | candidate.keys()
+                                 if opponent_anchor.get(square) != candidate.get(square)}
+                    moving = any(observation.squares[square].motion > .15 for square in endpoints
+                                 if square in observation.squares)
+                if opponent_anchor is not None and (candidate == opponent_anchor or moving):
+                    tracker.reset()
+                    if on_candidate is not None:
+                        on_candidate(None)
+                    detail = ""
+                elif accept is not None and not accept(candidate):
                     tracker.reset()
                     # _capture_mouse_board caches every structurally valid
                     # recognition before the caller can apply chess rules.  A
@@ -2325,12 +2340,14 @@ class XiangqiApp:
                 else:
                     latest = current
                     detail = ""
-                    if on_candidate is not None:
+                    if on_candidate is not None and opponent_anchor is None:
                         on_candidate(candidate)
                     if tracker.observe(candidate, geometry=current[2]):
                         if self._mouse_autoplay_cancelled(session_id, stop_event):
                             raise InterruptedError("用户已停止自动接管")
                         self.mouse_auto_geometry = current[2]
+                        if on_candidate is not None and opponent_anchor is not None:
+                            on_candidate(candidate)
                         if recovery_detail:
                             self._log_mouse_recovery(
                                 session_id,
@@ -2856,6 +2873,11 @@ class XiangqiApp:
                                 move_history.append(pending_confirmation.move)
                                 current_side = "b" if pending_side == "w" else "w"
                             self.mouse_resume_pending_board = None
+                            self.mouse_auto_transaction = None
+                            self.mouse_resume_pending_side = None
+                            self.mouse_resume_pending_history_fen = ""
+                            self.mouse_resume_pending_moves = []
+                            self.mouse_resume_pending_at = 0.0
                             self.logger.info(
                                 "mouse autoplay resumed pending transaction session=%s kind=%s reply=%s",
                                 session_id,
@@ -3050,11 +3072,11 @@ class XiangqiApp:
                     next_board, grid, geometry = self._capture_stable_mouse_board(
                         session_id,
                         stop_event,
-                        # A single full ONNX result is accepted only when it
-                        # exactly explains one move from the confirmed board.
-                        # That transition proof is stronger and much faster
-                        # than rerunning the expensive classifier unchanged.
-                        stable_frames=1,
+                        # A legal intermediate square is not the final move.
+                        # Require motion-free endpoints plus a timed stable run
+                        # before publishing history or starting the engine.
+                        stable_frames=3,
+                        opponent_anchor=dict(board),
                         allow_terminal=True,
                         accept=acceptable_opponent_board,
                         on_candidate=prepare_opponent_reply,

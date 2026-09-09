@@ -92,6 +92,8 @@ class StableBoardTracker:
     previous: dict[tuple[int, int], str] | None = None
     count: int = 0
     previous_geometry: object = None
+    minimum_seconds: float = 0.0
+    stable_since: float | None = None
 
     def observe(
         self,
@@ -115,15 +117,20 @@ class StableBoardTracker:
                 and all(math.dist(geometry.point_for_square(square), previous.point_for_square(square)) <= tolerance
                         for square in squares)
             )
-        self.count = self.count + 1 if board == self.previous and same_geometry else 1
+        same = board == self.previous and same_geometry
+        self.count = self.count + 1 if same else 1
+        now = time.monotonic()
+        if not same or self.stable_since is None:
+            self.stable_since = now
         self.previous = dict(board)
         self.previous_geometry = geometry if hasattr(geometry, "point_for_square") else None
-        return self.count >= self.required_frames
+        return self.count >= self.required_frames and now - self.stable_since >= self.minimum_seconds
 
     def reset(self) -> None:
         self.previous = None
         self.count = 0
         self.previous_geometry = None
+        self.stable_since = None
 
 
 @dataclass

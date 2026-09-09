@@ -76,6 +76,31 @@ class ClickReadyHarness:
 
 
 class AutoplayFlowTests(unittest.TestCase):
+    def test_opponent_animation_is_not_published_or_searched_early(self):
+        before, _ = parse_fen(START_FEN)
+        intermediate = apply_move(before, "a9a8")
+        final = apply_move(before, "a9a7")
+        geometry = object()
+        harness = CaptureHarness([(board, None, geometry) for board in
+                                  [before, before, intermediate, intermediate, *([final] * 12)]])
+        offered = []
+        clock = [0.0]
+
+        def now():
+            clock[0] += .1
+            return clock[0]
+
+        with patch('app.time.monotonic', side_effect=now):
+            board, _, _ = XiangqiApp._capture_stable_mouse_board(
+                harness, 7, threading.Event(), stable_frames=3,
+                opponent_anchor=before, accept=lambda board: board != before,
+                on_candidate=offered.append, max_attempts=20,
+            )
+        self.assertEqual(board, final)
+        self.assertEqual([board for board in offered if board is not None], [final])
+        self.assertEqual(harness.recoveries, [])
+        self.assertEqual(harness.statuses, [])
+
     @staticmethod
     def _endpoint_harness(frames):
         harness = CaptureHarness(frames)
@@ -411,6 +436,7 @@ class AutoplayLifecycleTests(unittest.TestCase):
         )
         app.mouse_auto_detect_side = False
         app.mouse_resume_pending_board = dict(pending)
+        app.mouse_auto_transaction = MoveTransaction(move, anchor, pending)
         app._mouse_sleep = Mock()
         app._capture_stable_mouse_board = Mock(return_value=(pending, None, geometry))
         app._window_for_geometry = Mock(return_value=42)
@@ -442,6 +468,9 @@ class AutoplayLifecycleTests(unittest.TestCase):
         self.assertEqual(published[0][2], "b")
         self.assertEqual(published[0][5], [move])
         self.assertIsNone(app.mouse_resume_pending_board)
+        self.assertIsNone(app.mouse_auto_transaction)
+        self.assertEqual(app.mouse_resume_pending_moves, [])
+        self.assertEqual(app.mouse_resume_pending_at, 0.0)
         app.engine.analyse.assert_not_called()
 
     def test_restart_waits_for_pending_position_instead_of_retrying(self):
