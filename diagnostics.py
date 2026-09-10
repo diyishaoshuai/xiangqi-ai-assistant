@@ -16,7 +16,7 @@ from app_paths import user_data_dir
 
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
-APP_VERSION = "2026.09.09-animation-gate"
+APP_VERSION = "2026.09.09-unified-performance"
 
 
 class SharedRotatingFileHandler(RotatingFileHandler):

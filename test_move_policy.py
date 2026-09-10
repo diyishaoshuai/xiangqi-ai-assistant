@@ -58,6 +58,13 @@ class MoveRiskTests(unittest.TestCase):
 
 
 class AdaptiveDecisionTests(unittest.TestCase):
+    def setUp(self):
+        # Budget assertions test policy tiers, not host scheduler jitter.
+        from unittest.mock import patch
+        clock = patch('app.time.monotonic', return_value=100.0)
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def make_app(self):
         app = object.__new__(XiangqiApp)
         app.engine = Mock()

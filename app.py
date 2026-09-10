@@ -51,6 +51,7 @@ from diagnostics import APP_VERSION, configure_logging, install_exception_loggin
 from hotkey import GlobalF1Hotkey
 from screen_cache import UnchangedBoardCache
 from search_pipeline import ConfirmedSearch
+from performance import resource_settings
 from move_policy import (
     MoveDecisionPolicy,
     result_is_legal,
@@ -91,6 +92,7 @@ from automation import (
     f1_pressed,
     foreground_window,
     legal_successors,
+    move_is_legal,
     position_is_safe,
     position_is_terminal,
     project_legal_path,
@@ -138,7 +140,7 @@ def _completed_legal_result(
         return result
     line = result.primary
     if (
-        result.trust_reason == "bestmove_pv_mismatch"
+        result.trust_reason in {"bestmove_pv_mismatch", "fallback_last_complete_pv"}
         and line is not None
         and result_is_legal(
             board,
@@ -383,9 +385,8 @@ class XiangqiApp:
         self.closing = False
 
         cpu_count = os.cpu_count() or 4
-        self.engine = PikafishEngine(
-            find_engine(), threads=max(1, min(8, cpu_count - 1)), hash_mb=256
-        )
+        resources = resource_settings()
+        self.engine = PikafishEngine(find_engine(), threads=resources['threads'], hash_mb=resources['hash_mb'])
         self.recognizer = PieceRecognizer() if PieceRecognizer is not None else None
         self.review_image_tk = None
 
@@ -693,18 +694,18 @@ class XiangqiApp:
         followed_recommendation = self.follow_move_pending
         followed_description = self.follow_move_description
         move = square_name(self.selected_square) + square_name(square)
+        if not move_is_legal(self.board, move, self.side):
+            self.selected_square = None
+            self.status_var.set("走子不能衔接当前轮次，未修改棋盘；请重新截图同步，或使用摆局工具")
+            self.logger.warning("manual move rejected fen=%s move=%s", make_fen(self.board, self.side), move)
+            return
         self._record_undo()
         piece = self.board.pop(self.selected_square)
         self.board[square] = piece
         self.side = "b" if piece_side(piece) == "w" else "w"
-        if followed_recommendation:
-            self.engine_move_history.append(move)
-            self._position_changed()
-        else:
-            # Free-form manual edits are accepted by the board UI. Treat the
-            # resulting position as a fresh history root so an accidental
-            # illegal edit can never terminate the UCI engine.
-            self._position_changed(reset_history=True)
+        # A legal move extends history; only explicit setup/import starts a new root.
+        self.engine_move_history.append(move)
+        self._position_changed()
         if followed_recommendation:
             if self._record_completed_follow_position():
                 return
@@ -751,17 +752,16 @@ class XiangqiApp:
                 prior.wdl,
                 " ".join(self.engine_move_history),
             )
-            messagebox.showwarning("循环已停止", message)
+            # A synchronization pause is status-only, never a modal interruption.
         else:
             message = (
                 "已检测到同一局面出现 3 次，当前局面的自动跟随已暂停。\n\n"
                 "引擎没有找到可保持胜势的避循环方案。"
-                "如果当前关卡必须获胜，建议直接认输并重开。\n\n"
+                "请重新截图同步棋盘后继续。\n\n"
                 "“跟随首选着”的勾选偏好没有改变；载入新的可胜局面后会自动恢复。"
             )
-            self.status_var.set("检测到三次重复局面：已停止循环，建议认输重开")
+            self.status_var.set("检测到三次重复局面：已暂停跟随，请重新截图同步后继续")
             self.logger.warning("threefold loop stopped fen=%s", signature)
-            messagebox.showwarning("建议认输", message)
         return True
 
     def _record_assisted_check(
@@ -1087,9 +1087,10 @@ class XiangqiApp:
         )
         if self.side == self.assisted_side and visit_count >= 2:
             avoided_moves = set(self.used_root_moves.get(signature, set()))
-        movetime, multipv = bounded_search_settings(
-            movetime, multipv, repeating=bool(avoided_moves), checking=avoid_checks,
-        )
+        # Assisted play uses the same single-PV safety policy as mouse play.
+        # Additional candidates remain available only for manual analysis.
+        if self.follow_best_var.get() and self.side == self.assisted_side:
+            multipv = 1
         mode = "自动分析" if not manual else "分析"
         if avoided_moves and avoid_checks:
             self.status_var.set(
@@ -1144,46 +1145,28 @@ class XiangqiApp:
         avoid_checks: bool,
     ) -> None:
         try:
-            lines, bestmove = self.engine.analyse(
+            cancelled = lambda: self.closing or generation != self.analysis_generation
+            value = self.engine.analyse(
                 fen,
                 movetime,
                 multipv,
                 history_fen=history_fen,
                 moves=move_history,
+                cancelled=cancelled,
             )
-            lines, replacement = prefer_fresh_winning_line(lines, avoided_moves)
-            if replacement is not None:
-                old_best = bestmove
-                bestmove = replacement
-                self.logger.warning(
-                    "anti-loop promoted move fen=%s old=%s new=%s avoided=%s history=%s",
-                    fen,
-                    old_best,
-                    replacement,
-                    sorted(avoided_moves),
-                    " ".join(move_history),
+            result = _coerce_engine_result(value)
+            if side_snapshot == self.assisted_side and multipv == 1:
+                result = self._choose_autoplay_result(
+                    generation, threading.Event(), board_snapshot, side_snapshot,
+                    fen, history_fen, move_history, movetime, result, avoided_moves, avoid_checks,
+                    cancelled_callback=cancelled,
+                    status_callback=lambda text: self.result_queue.put(("analysis_status", (generation, text))),
                 )
-            quiet_replacement = None
+            if cancelled():
+                return
+            lines, bestmove = result.lines, result.bestmove
+            replacement = quiet_replacement = None
             quiet_unavailable = False
-            if avoid_checks and lines:
-                quiet_needed = _checking_line_should_yield(
-                    lines[0], board_snapshot, side_snapshot
-                )
-                lines, quiet_replacement = prefer_quiet_winning_line(
-                    lines, board_snapshot, side_snapshot
-                )
-                quiet_unavailable = quiet_needed and quiet_replacement is None
-                if quiet_replacement is not None:
-                    old_best = bestmove
-                    bestmove = quiet_replacement
-                    self.logger.warning(
-                        "anti-check promoted move fen=%s old=%s new=%s streak=%s history=%s",
-                        fen,
-                        old_best,
-                        quiet_replacement,
-                        self.consecutive_assisted_checks,
-                        " ".join(move_history),
-                    )
             self.result_queue.put(
                 (
                     "analysis",
@@ -1199,6 +1182,8 @@ class XiangqiApp:
                     ),
                 )
             )
+        except InterruptedError:
+            return
         except Exception as exc:
             self.result_queue.put(("error", (generation, exc, manual)))
 
@@ -1210,7 +1195,11 @@ class XiangqiApp:
         try:
             while True:
                 kind, payload = self.result_queue.get_nowait()
-                if kind == "analysis":
+                if kind == "analysis_status":
+                    generation, text = payload
+                    if generation == self.analysis_generation:
+                        self.status_var.set(text)
+                elif kind == "analysis":
                     (
                         generation,
                         lines,
@@ -1372,10 +1361,9 @@ class XiangqiApp:
             if blocked is not None and blocked[0] == "no_win":
                 self.follow_blocked_positions.pop(notice_key, None)
             return False
-        self.follow_move_pending = False
-        self.follow_move_description = None
-        self.follow_blocked_positions[notice_key] = ("no_win", reason)
-        self.status_var.set(f"{score}：当前局面无法取胜，已暂停跟随；建议认输重开")
+        if self.follow_blocked_positions.get(notice_key, (None,))[0] == "no_win":
+            self.follow_blocked_positions.pop(notice_key, None)
+        self.status_var.set(f"{score}；{reason}；继续寻找最佳应对，不暂停跟随")
         self.logger.warning(
             "no-win outcome fen=%s depth=%s score=%s:%s wdl=%s reason=%s",
             notice_key,
@@ -1385,23 +1373,6 @@ class XiangqiApp:
             line.wdl,
             reason,
         )
-        if notice_key not in self.outcome_notice_keys:
-            self.outcome_notice_keys.add(notice_key)
-            wdl_text = ""
-            if line.wdl is not None:
-                wins, draws, losses = line.wdl
-                wdl_text = (
-                    f"\n\nWDL：胜 {wins / 10:.1f}% / "
-                    f"和 {draws / 10:.1f}% / 负 {losses / 10:.1f}%"
-                )
-            messagebox.showwarning(
-                "建议认输",
-                f"{reason}。{wdl_text}\n\n"
-                "当前局面的自动跟随已暂停，不会继续循环；"
-                "你的勾选偏好没有改变，进入新的可胜局面后会自动恢复。\n\n"
-                "如果当前关卡必须获胜，请直接认输并重开。\n\n"
-                f"分析日志：{self.log_path}",
-            )
         return True
 
     def _analysis_selected(self, _event=None) -> None:
@@ -1453,9 +1424,11 @@ class XiangqiApp:
         signature = make_fen(self.board, self.side)
         blocked = self.follow_blocked_positions.get(signature)
         if blocked is not None:
-            next_step = "请认输重开或载入新局面" if blocked[0] == "no_win" else "请重新截图同步或载入新局面"
-            self.status_var.set(f"{blocked[1]}；{next_step}")
-            return True
+            if blocked[0] == "no_win":
+                self.follow_blocked_positions.pop(signature, None)
+            else:
+                self.status_var.set(f"{blocked[1]}；请重新截图同步或载入新局面")
+                return True
         line = self._current_analysis_line()
         if line is None:
             return False
@@ -2601,13 +2574,25 @@ class XiangqiApp:
         base_value,
         avoided: set[str],
         avoid_checks: bool,
+        *,
+        cancelled_callback=None,
+        status_callback=None,
     ) -> EngineSearchResult:
-        cancelled = lambda: self._mouse_autoplay_cancelled(session_id, stop_event)
+        cancelled = cancelled_callback or (lambda: self._mouse_autoplay_cancelled(session_id, stop_event))
+        report_status = status_callback or (lambda text: self._queue_mouse_status(session_id, AutomationState.THINKING, text))
+        if cancelled():
+            raise InterruptedError("搜索已取消")
         base = _coerce_engine_result(base_value)
+        if not base.lines and base.bestmove == "(none)":
+            return base  # Caller handles no-legal-move/terminal without clicking.
+        decision_started = time.monotonic()
+        def remaining(tier):
+            spent = base.elapsed_ms + (time.monotonic() - decision_started) * 1000
+            return max(0, int(max(base_movetime, tier) - spent))
         chosen = base
         restricted_moves: list[str] | None = None
         needs_restriction = False
-        if result_is_legal(board, side, base):
+        if base.trusted and result_is_legal(board, side, base):
             try:
                 base_checks = move_gives_check(board, side, base.bestmove)
             except ValueError:
@@ -2626,12 +2611,10 @@ class XiangqiApp:
             restricted_moves = self._restricted_autoplay_moves(
                 board, side, avoided, avoid_checks
             )
-            if restricted_moves:
-                restricted_budget = max(base_movetime, 3000)
+            if restricted_moves and remaining(5000) >= 100:
+                restricted_budget = min(3000, remaining(5000))
                 reason = "旧循环" if base.bestmove in avoided else "连续将军"
-                self._queue_mouse_status(
-                    session_id,
-                    AutomationState.THINKING,
+                report_status(
                     f"正在对{reason}替代着进行 {restricted_budget / 1000:g} 秒安全复核；F1 急停",
                 )
                 restricted = _coerce_engine_result(self.engine.analyse(
@@ -2646,6 +2629,7 @@ class XiangqiApp:
                 restricted_choice = _completed_legal_result(board, side, restricted)
                 if (
                     restricted_choice is not None
+                    and restricted.trusted
                     and restricted_result_is_acceptable(base, restricted_choice)
                 ):
                     chosen = restricted_choice
@@ -2671,10 +2655,18 @@ class XiangqiApp:
         if risk.needs_verification and (
             risk.verification_ms > base_movetime or not chosen.trusted
         ):
-            verify_budget = max(base_movetime, risk.verification_ms)
-            self._queue_mouse_status(
-                session_id,
-                AutomationState.THINKING,
+            tier = max(3000, risk.verification_ms)
+            if not chosen.trusted and remaining(tier) < 100:
+                tier = 5000
+            verify_budget = remaining(tier)
+            if verify_budget < 100:
+                completed = _completed_legal_result(board, side, chosen) or _completed_legal_result(board, side, base)
+                if cancelled():
+                    raise InterruptedError("搜索已取消")
+                if completed is None:
+                    raise EngineError("搜索预算已用完且无完整合法着法；请核对棋盘")
+                return completed
+            report_status(
                 f"检测到{risk.status_text}，正在进行 {verify_budget / 1000:g} 秒安全复核；F1 急停",
             )
             verified = _coerce_engine_result(self.engine.analyse(
@@ -2687,7 +2679,10 @@ class XiangqiApp:
                 cancelled=cancelled,
             ))
             verified_choice = _completed_legal_result(board, side, verified)
-            if verified_choice is not None:
+            if verified_choice is not None and (
+                verified.trusted or _completed_legal_result(board, side, chosen) is None
+                or verified.completed_depth >= chosen.completed_depth
+            ):
                 chosen = verified_choice
             self.logger.info(
                 "autoplay safety verification session=%s severity=%s reasons=%r budget_ms=%s "
@@ -2711,7 +2706,14 @@ class XiangqiApp:
                 chosen.completed_depth,
                 chosen.trusted,
             )
-        return chosen
+        if cancelled():
+            raise InterruptedError("搜索已取消")
+        completed = _completed_legal_result(board, side, chosen)
+        if completed is None:
+            completed = _completed_legal_result(board, side, base)
+        if completed is None:
+            raise EngineError("没有完整合法的搜索结果，请核对棋盘后重新分析")
+        return completed
 
     def _mouse_autoplay_worker(
         self,
@@ -3059,6 +3061,10 @@ class XiangqiApp:
                         )
 
                     def prepare_opponent_reply(candidate):
+                        # An animation/unchanged frame cannot consume a prediction,
+                        # but must not cancel it on every screenshot either.
+                        if candidate is None:
+                            return
                         transition = classify_board_transition(board, candidate, current_side) if candidate is not None else None
                         if transition is not None and transition.kind == TransitionKind.MOVE:
                             offer_candidate(
@@ -3622,6 +3628,11 @@ class XiangqiApp:
                         )
                         move_finished = True
                         self.mouse_auto_transaction = None
+                        pv = chosen_result.primary.pv if chosen_result.primary else []
+                        if (not game_over and len(pv) > 1 and pv[0] == bestmove
+                                and move_is_legal(board, pv[1], current_side)):
+                            offer_candidate(apply_move(board, pv[1]), [*move_history, pv[1]], consecutive_checks)
+                            self.logger.info("ponder offered session=%s reply=%s; exact board/history required", session_id, pv[1])
                         continue
 
                     fast_reply = confirmation.move
@@ -3914,10 +3925,8 @@ def outcome_guard_self_test() -> int:
         blocked = app.follow_blocked_positions.get(signature)
         if (
             not app.follow_best_var.get()
-            or blocked is None
-            or blocked[0] != "no_win"
-            or not warnings
-            or "建议认输" not in warnings[-1][0]
+            or blocked is not None
+            or warnings
         ):
             return 20
 
@@ -3929,8 +3938,8 @@ def outcome_guard_self_test() -> int:
         if (
             blocked is None
             or blocked[0] != "repetition"
-            or len(warnings) < 2
-            or "3 次" not in warnings[-1][1]
+            or warnings
+            or "三次重复" not in app.status_var.get()
         ):
             return 22
 
@@ -3948,8 +3957,8 @@ def outcome_guard_self_test() -> int:
         if (
             blocked is None
             or blocked[0] != "repetition_win"
-            or warnings[-1][0] != "循环已停止"
-            or "不能把它误报成无胜" not in warnings[-1][1]
+            or warnings
+            or "请重新截图同步" not in app.status_var.get()
         ):
             return 47
         return 0

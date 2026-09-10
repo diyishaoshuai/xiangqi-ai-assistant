@@ -374,19 +374,19 @@ def score_text(line: AnalysisLine, root_side: str) -> str:
 
 
 def no_win_reason(line: AnalysisLine, minimum_depth: int = 24) -> str | None:
-    """Return a user-facing reason when best play gives the root side no win."""
+    """Return a forecast, never a proven outcome or instruction to stop play."""
     if line.score_type == "mate" and line.score < 0:
-        return f"引擎已算出己方将在 {abs(line.score)} 步内被将死"
+        return f"当前搜索发现被将死风险（杀分 {abs(line.score)}），仍继续寻找抵抗"
     if line.depth < minimum_depth or line.wdl is None:
         return None
     wins, draws, losses = line.wdl
     if wins != 0:
         return None
     if draws == 1000 and losses == 0:
-        return "引擎判定为理论和棋，最佳对弈下无法取胜"
+        return "引擎估计局面趋于和棋，不代表已证明理论和棋"
     if losses == 1000 and draws == 0:
-        return "引擎判定为必败局面，最佳对弈下无法取胜"
+        return "引擎估计明显劣势，负权重达到显示上限；不代表实际必输"
     return (
-        "引擎给出的获胜权重为 0，最佳对弈下只能争和或落败"
+        "引擎获胜权重低至显示为 0，不等于没有获胜可能"
         f"（和 {draws / 10:.1f}% / 负 {losses / 10:.1f}%）"
     )

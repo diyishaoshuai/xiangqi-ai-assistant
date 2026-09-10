@@ -278,10 +278,10 @@ class PikafishEngine:
                            and (requested_complete or int(multipv) == 1))
             if trusted:
                 trust_reason = "complete_iteration"
-            elif not best_matches:
-                trust_reason = "bestmove_pv_mismatch"
             elif not exact_bucket:
                 trust_reason = "bound_or_partial_iteration"
+            elif not best_matches:
+                trust_reason = "bestmove_pv_mismatch"
             else:
                 trust_reason = "incomplete_multipv_iteration"
 

@@ -81,10 +81,13 @@ def automation_probe():
     import test_autoplay_speed
     import test_search_pipeline
     import test_player_side
+    import test_unified_safety
+    import test_vision_runtime
+    import test_move_policy
 
     stream = io.StringIO()
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromModule(module)
-                              for module in (test_automation, test_app_automation, test_app_logic, test_hotkey, test_autoplay_speed, test_search_pipeline, test_player_side))
+                              for module in (test_automation, test_app_automation, test_app_logic, test_hotkey, test_autoplay_speed, test_search_pipeline, test_player_side, test_unified_safety, test_vision_runtime, test_move_policy))
     result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
     save_report("automation-probe.json", {"success": result.wasSuccessful(),
                 "tests": result.testsRun, "output": stream.getvalue()})

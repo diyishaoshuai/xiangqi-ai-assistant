@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 from abc import ABC, abstractmethod
 from typing import Any, Tuple, Union, List
+from vision_runtime import VerifiedSession
 
 class BaseONNX(ABC):
     def __init__(self, model_path: str, input_size: Tuple[int, int]):
@@ -26,7 +27,7 @@ class BaseONNX(ABC):
         options.inter_op_num_threads = 1
         options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         options.add_session_config_entry("session.inter_op.allow_spinning", "0")
-        self.session = onnxruntime.InferenceSession(model_path, sess_options=options)
+        self.session = VerifiedSession(model_path, options)
         self.input_name = self.session.get_inputs()[0].name
         self.input_size = input_size
 

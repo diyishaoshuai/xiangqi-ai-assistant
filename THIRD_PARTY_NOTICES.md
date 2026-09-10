@@ -17,4 +17,6 @@ https://github.com/ra1nty/DXcam
 
 ONNX 推理依赖 ONNX Runtime、OpenCV-Python Headless 和 NumPy。对应许可证与第三方组件说明位于 `licenses/vision/`。
 
+Windows 版使用 ONNX Runtime DirectML 1.24.4（MIT）提供可选 GPU 推理，包含 Microsoft DirectML 1.15.4 再分发运行库。DirectML 适用独立的 Microsoft 软件许可条款，见 `licenses/vision/DirectML-LICENSE.txt`。未修改模型权重；GPU 不可用、输出校验失败或设备丢失时使用 CPU。
+
 本地集成修改（2026-08-31）：`cchess_onnx/base_onnx.py` 限制每个模型会话的 CPU 线程数并关闭空闲自旋，给游戏、界面及急停监听保留响应时间；模型权重未修改。

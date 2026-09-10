@@ -268,4 +268,16 @@ python build_support/benchmark_autoplay.py --image C:\path\to\board.png --output
 
 ## 注意
 
+### 2026.09.09 统一安全与性能版
+
+跟随首选着和屏幕接管共用单主变化安全复核；WDL 不再触发劝降、弹窗或停止同步。对手回合支持有界预测搜索，只有视觉确认的完整棋局历史吻合才复用。
+
+性能配置位于 `%LOCALAPPDATA%\XiangqiAI\performance.json`，重启后生效，例如：
+
+```json
+{"threads": 14, "hash_mb": 256, "vision_device": 0}
+```
+
+以上是本次测试机器的配置，不是所有机器的推荐值。线程会限制为最多逻辑线程数减二（至少一线程）；缓存允许 64–2048 MB；`vision_device: -1` 强制 CPU。GPU 设备编号取决于电脑，初始化或推理失败会回退 CPU。没有配置文件时默认最多 12 搜索线程、256 MB、CPU 识别。测试工具不控制实际游戏；数据与限制见[发布说明](docs/releases/v2026.09.09-unified-performance.md)。
+
 请仅在游戏规则允许的场景使用，例如单机残局、复盘和学习。
