@@ -620,6 +620,7 @@ class AutoplayLifecycleTests(unittest.TestCase):
             ((start[0], start[1], *observed_start),),
         )
         app._capture_mouse_board = Mock(side_effect=[(board, None, geometry)] * 6 + [(expected, None, geometry)] * 2)
+        app._audit_click_frame = Mock(return_value=(board, None, geometry))
         app._mouse_sleep = Mock()
         app._window_for_geometry = Mock(return_value=42)
         app.engine.analyse.return_value = ([AnalysisLine(1, 40, "mate", 12, [move], (1000, 0, 0))], move)
@@ -661,6 +662,7 @@ class AutoplayLifecycleTests(unittest.TestCase):
         geometry = BoardGeometry(
             (1, 0, 0, 0, 1, 0, 0, 0, 1), False, .8, (500, 500)
         )
+        app._audit_click_frame = Mock(return_value=(board, None, geometry))
         app._capture_mouse_board = Mock(
             side_effect=[(board, None, geometry)] * 6
             + [(expected, None, geometry)] * 2
@@ -757,6 +759,7 @@ class AutoplayLifecycleTests(unittest.TestCase):
             return final, None, geometry
 
         app._capture_stable_mouse_board = capture
+        app._audit_click_frame = Mock(side_effect=lambda session, stop, board, source: (board, None, geometry))
         queue_board = app._queue_mouse_board
 
         def publish(*args):

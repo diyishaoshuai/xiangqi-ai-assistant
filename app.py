@@ -584,9 +584,17 @@ class XiangqiApp:
                 }
                 for square, evidence in observation.squares.items()
             }
+        click_geometry = getattr(self, "mouse_auto_click_geometry", None)
+        click_frame = getattr(self, "mouse_auto_click_frame", None)
+        frames = list(frame_source.frames)
+        if click_frame is not None:
+            frames = frames[-11:] + [click_frame]
+        diagnostic_geometry = click_geometry or getattr(self, "mouse_auto_geometry", None)
+        frames = ([frame for frame in frames if frame[1].size == diagnostic_geometry.image_size]
+                  if diagnostic_geometry is not None else [])
         path = recorder.save(
             "move-uncertain",
-            frame_source.frames,
+            frames,
             {
                 "session_id": session_id,
                 "move": transaction.move,
@@ -598,8 +606,10 @@ class XiangqiApp:
                 ),
                 "reason": reason,
                 "probability_matrix": probability_matrix,
+                "click_matrix": getattr(click_geometry, "inverse_matrix", None),
+                "click_image_size": getattr(click_geometry, "image_size", None),
             },
-            getattr(self, "mouse_auto_geometry", None),
+            diagnostic_geometry,
         )
         transaction.diagnostic_saved = True
         self.logger.warning("mouse autoplay diagnostic saved path=%s", path)
@@ -1272,6 +1282,16 @@ class XiangqiApp:
                         continue
                     self.mouse_auto_state = state
                     self.status_var.set(str(status))
+                elif kind == "mouse_evaluation":
+                    session_id, board, side, history_fen, moves, line = payload
+                    if session_event_is_current(session_id, self.mouse_auto_session_id,
+                            running=self.mouse_auto_running,
+                            stopping=self.mouse_auto_state == AutomationState.STOPPING):
+                        # Worker results are immutable position snapshots, never
+                        # attached to whatever manual analysis happens to be selected.
+                        if self.engine_history_fen == history_fen and tuple(self.engine_move_history) == tuple(moves) and self.board == board and self.side == side:
+                            self.ui.winrate_chart.history.record(history_fen, moves, line, side)
+                            self.ui.winrate_chart.redraw()
                 elif kind == "mouse_done":
                     session_id, level, title, detail = payload
                     if session_id != self.mouse_auto_session_id:
@@ -1292,6 +1312,9 @@ class XiangqiApp:
         quiet_unavailable: bool = False,
     ) -> None:
         self.analysis_lines = lines
+        record_winrate = getattr(getattr(self, "ui", None), "record_winrate", None)
+        if lines and callable(record_winrate):
+            record_winrate(lines[0])
         for item in self.tree.get_children():
             self.tree.delete(item)
         for index, line in enumerate(lines):
@@ -1757,8 +1780,13 @@ class XiangqiApp:
                 cancelled=cancelled,
                 tracking_only=tracking_only,
                 allow_ambiguous=allow_partial,
+                require_grid=not allow_partial,
             )
         except RuntimeError as exc:
+            if "网格" in str(exc) or "棋盘映射" in str(exc):
+                self.mouse_auto_geometry = None
+                if cache is not None:
+                    cache.clear()
             self.logger.debug("mouse capture unavailable session=%s elapsed_ms=%.1f stages=%s reason=%s",
                               session_id, (time.monotonic() - started) * 1000,
                               getattr(getattr(self.recognizer, "neural", None), "last_timings", None), exc)
@@ -1831,6 +1859,19 @@ class XiangqiApp:
             raise RuntimeError(
                 f"棋盘定位置信度过低（{geometry.confidence:.2f}）"
             )
+        if not allow_partial:
+            from grid_geometry import audit_grid
+            audit = audit_grid(image, geometry, board)
+            if not audit.safe:
+                self.mouse_auto_geometry = None
+                if cache is not None:
+                    cache.clear()
+                neural = getattr(self.recognizer, "neural", None)
+                if neural is not None:
+                    neural.last_search_bbox = None
+                self.logger.warning("capture grid rejected session=%s audit=%s matrix=%s",
+                                    session_id, audit.metadata(), geometry.inverse_matrix)
+                raise RuntimeError(audit.reason)
         if not allow_partial and getattr(self, "mouse_auto_detect_side", False) and position_is_safe(board):
             side = bottom_player_side(board, geometry, king_confidences={
                 item.piece: item.confidence for item in detections if item.piece in ("K", "k")})
@@ -2115,6 +2156,38 @@ class XiangqiApp:
                 return latest
             self._mouse_sleep(session_id, stop_event, 0.05)
 
+    def _audit_click_frame(self, session_id, stop_event, board, source_square):
+        from grid_geometry import audit_grid
+        if self._mouse_autoplay_cancelled(session_id, stop_event):
+            raise InterruptedError("用户已停止自动接管")
+        image = self._grab_screen()
+        self.mouse_auto_frame_cache.clear()
+        self.mouse_auto_geometry = None
+        neural = getattr(self.recognizer, "neural", None)
+        if neural is not None:
+            neural.last_search_bbox = None
+        current = self._capture_mouse_board(session_id, stop_event, image=image)
+        candidate, grid, geometry = current
+        audit = audit_grid(image, geometry, candidate, source_square)
+        self.logger.info("preclick grid audit session=%s audit=%s source=%s intersection=%s disc=%s matrix=%s",
+                         session_id, audit.metadata(), source_square,
+                         geometry.point_for_square(source_square), geometry.point_for_piece(source_square),
+                         geometry.inverse_matrix)
+        if candidate != board or not audit.safe:
+            now = time.monotonic()
+            if now - getattr(self, "mouse_auto_audit_saved_at", -100) > 10:
+                self.mouse_auto_audit_saved_at = now
+                try:
+                    self.diagnostic_recorder.save("geometry-rejected", [(now, image)],
+                        {"audit": audit.metadata(), "matrix": geometry.inverse_matrix,
+                         "source": source_square, "same_board": candidate == board}, geometry)
+                except Exception:
+                    self.logger.exception("could not save geometry audit")
+            raise RuntimeError(audit.reason if not audit.safe else "新截图局面与待执行着法不一致")
+        self.mouse_auto_click_frame = (time.monotonic(), image)
+        self.mouse_auto_geometry = geometry
+        return current
+
     def _capture_unchanged_click_board(self, session_id, stop_event, board):
         """Fresh, byte-exact screenshot proof of the already-confirmed board."""
         cache = getattr(self, "mouse_auto_frame_cache", None)
@@ -2249,6 +2322,10 @@ class XiangqiApp:
         attempts = 0
         last_progress_bucket = -1
         recovery_stage = 0
+        opponent_problem_since = None
+        opponent_relock_at = 0.0
+        opponent_diagnostic_saved = False
+        rejected_candidate = None
         while True:
             if self._mouse_autoplay_cancelled(session_id, stop_event):
                 raise InterruptedError("用户已停止自动接管")
@@ -2297,7 +2374,9 @@ class XiangqiApp:
                     tracker.reset()
                     if on_candidate is not None:
                         on_candidate(None)
-                    detail = ""
+                    detail = "对手落子区域仍有动画或光效" if moving else ""
+                    if not moving:
+                        opponent_problem_since = None
                 elif accept is not None and not accept(candidate):
                     tracker.reset()
                     # _capture_mouse_board caches every structurally valid
@@ -2305,8 +2384,9 @@ class XiangqiApp:
                     # rejected post-click board must never poison all later
                     # retries with the same decoded result.
                     cache = getattr(self, "mouse_auto_frame_cache", None)
-                    if use_tracking_only and cache is not None:
+                    if cache is not None:
                         cache.clear()
+                    rejected_candidate = dict(candidate)
                     if on_candidate is not None:
                         on_candidate(None)
                     detail = "盘面变化尚未通过安全校验"
@@ -2341,6 +2421,51 @@ class XiangqiApp:
                     f"{status}：{detail}；F1 急停",
                 )
             transaction = getattr(self, "mouse_auto_transaction", None)
+            if opponent_anchor is not None and detail:
+                now = time.monotonic()
+                if opponent_problem_since is None:
+                    opponent_problem_since = now
+                elapsed = now - opponent_problem_since
+                if elapsed >= 3.0 and now >= opponent_relock_at:
+                    # Rejecting a decoded board must invalidate both cached
+                    # labels and the pose hint, even outside click transactions.
+                    geometry = getattr(self, "mouse_auto_geometry", None)
+                    cache = getattr(self, "mouse_auto_frame_cache", None)
+                    if cache is not None:
+                        cache.clear()
+                    self.mouse_auto_geometry = None
+                    tracker.reset()
+                    opponent_relock_at = now + (5.0 if elapsed < 8.0 else 10.0)
+                    differences = {
+                        str(square): [opponent_anchor.get(square), (rejected_candidate or {}).get(square)]
+                        for square in opponent_anchor.keys() | (rejected_candidate or {}).keys()
+                        if opponent_anchor.get(square) != (rejected_candidate or {}).get(square)
+                    } if rejected_candidate is not None else {}
+                    logger = getattr(self, "logger", None)
+                    if logger is not None:
+                        logger.warning("opponent recovery session=%s elapsed=%.1f reason=%s differences=%s strategy=full_relock",
+                                       session_id, elapsed, detail, differences)
+                    self._queue_mouse_status(
+                        session_id, AutomationState.WAITING_BOARD,
+                        f"棋盘同步异常 {int(elapsed)} 秒：{detail}；正在重新定位，工作台保留最后确认局面；不会盲目落子，F1 急停",
+                    )
+                    recorder = getattr(self, "diagnostic_recorder", None)
+                    source = getattr(self, "frame_source", None)
+                    if not opponent_diagnostic_saved and recorder is not None and source is not None and geometry is not None:
+                        observation = getattr(self, "mouse_auto_last_observation", None)
+                        probabilities = ({str(s): {"empty": e.empty, "red": e.red, "black": e.black,
+                                                  "occluded": e.occluded, "motion": e.motion, "pieces": e.pieces}
+                                          for s, e in observation.squares.items()} if observation is not None else None)
+                        try:
+                            # Never persist a full desktop when no board geometry is available.
+                            frames = [f for f in source.frames if f[1].size == geometry.image_size]
+                            recorder.save("opponent-uncertain", frames,
+                                          {"session_id": session_id, "reason": detail, "elapsed": elapsed,
+                                           "differences": differences, "probability_matrix": probabilities}, geometry)
+                            opponent_diagnostic_saved = True
+                        except Exception:
+                            if logger is not None:
+                                logger.exception("could not save opponent diagnostic")
             if transaction is not None and transaction.state in (
                 TransactionState.OBSERVING,
                 TransactionState.UNCERTAIN,
@@ -2386,6 +2511,8 @@ class XiangqiApp:
             # These are still independent screenshots, not repeated reads of one
             # image. Unchanged frames no longer need a full model inference.
             delay = 0.06 if not detail else 0.12
+            if opponent_problem_since is not None and time.monotonic() - opponent_problem_since >= 8.0:
+                delay = 0.75
             if detail and max_attempts is None and tracking_only:
                 delay = min(0.60, 0.12 + attempts * 0.03)
                 if transaction is not None and transaction.elapsed >= 8.0:
@@ -3206,6 +3333,8 @@ class XiangqiApp:
                     )
 
                 start, end = parse_move(bestmove)
+                self.result_queue.put(("mouse_evaluation", (session_id, dict(board), current_side,
+                                                          history_fen, tuple(move_history), lines[0])))
                 moving_piece = board.get(start)
                 if moving_piece is None or piece_side(moving_piece) != assisted_side:
                     raise FatalAutomationError(
@@ -3289,9 +3418,27 @@ class XiangqiApp:
                         break
                     if auto_detect_side and bottom_player_side(fresh_board, geometry) != assisted_side:
                         raise FatalAutomationError("点击前检测到棋盘朝向改变或执棋方不明确，已禁止点击。请确认当前对局后重新接管。")
+                    try:
+                        # Never authorize input from the decoded-frame cache.
+                        # Re-locate without a historical pose and validate both
+                        # position and geometry on one newly captured image.
+                        checked = self._audit_click_frame(session_id, stop_event, before, start)
+                        grid, geometry = checked[1], checked[2]
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        self.mouse_auto_geometry = None
+                        self.mouse_auto_frame_cache.clear()
+                        self._queue_mouse_status(session_id, AutomationState.WAITING_BOARD,
+                                                 f"点击前定位未通过：{exc}；重新识别，不发送鼠标点击，F1 急停")
+                        self._mouse_sleep(session_id, stop_event, .3)
+                        continue
+                    if foreground_window() != target_window or not user_input_is_idle(1.2):
+                        continue
                     grid_start_point = geometry.point_for_square(start)
                     start_point = geometry.point_for_piece(start)
                     end_point = geometry.point_for_square(end)
+                    self.mouse_auto_click_geometry = geometry
                     width, height = geometry.image_size
                     if any(
                         not (2 <= x < width - 2 and 2 <= y < height - 2)

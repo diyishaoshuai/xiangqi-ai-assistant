@@ -798,7 +798,7 @@ class NeuralBoardRecognizer:
                   minimum_geometry_confidence: float = 0.0,
                   cancelled=None,
                   tracking_only: bool = False,
-                  allow_ambiguous: bool = False) -> tuple[Image.Image, list[Detection]]:
+                  allow_ambiguous: bool = False, require_grid: bool = False) -> tuple[Image.Image, list[Detection]]:
         def check_cancelled():
             if cancelled is not None and cancelled():
                 raise InterruptedError("用户已停止自动接管")
@@ -847,6 +847,12 @@ class NeuralBoardRecognizer:
                 # automation will reject, when another region can locate it safely.
                 if min(keypoint_scores, default=0.0) < minimum_geometry_confidence:
                     raise RuntimeError(f"棋盘定位置信度过低（{min(keypoint_scores):.2f}）")
+                from grid_geometry import refine_grid_lines
+                proposal = self._geometry_from_keypoints(keypoints, keypoint_scores,
+                    rotated=False, image_size=image.size)
+                calibrated_grid = refine_grid_lines(image, proposal)
+                keypoints = np.float32([calibrated_grid.point_for_square(s)
+                                       for s in ((0,9),(8,9),(0,0),(8,0))])
                 transformed, _, _ = extract_chessboard(image_rgb, keypoints)
                 _, rows, confidences, layout = predict(self.classifier, "classifier",
                     transformed, is_rgb=True
@@ -868,6 +874,22 @@ class NeuralBoardRecognizer:
                             if self.tracking_failures < 3:
                                 raise TransientBoardFrame(f"棋盘动画/遮挡，本帧有 {unknown} 个低置信度格子；等待新帧")
                         raise RuntimeError(f"本帧有 {unknown} 个低置信度格子")
+                candidate_geometry = None
+                if require_grid and not allow_ambiguous:
+                    from grid_geometry import audit_grid
+                    rotated = self._needs_rotation(rows)
+                    candidate_board = {((8-c,r) if rotated else (c,9-r)): label
+                        for r,row in enumerate(rows) for c,label in enumerate(row)
+                        if label in "KABNRCPkabnrcp"}
+                    candidate_geometry = self._geometry_from_keypoints(keypoints,keypoint_scores,
+                        rotated=rotated,image_size=image.size)
+                    candidate_geometry = self._refine_geometry_from_pieces(image,candidate_geometry,candidate_board)
+                    audit = audit_grid(image,candidate_geometry,candidate_board)
+                    check_cancelled()
+                    if not audit.safe:
+                        self.last_timings["grid_rejected"] = self.last_timings.get("grid_rejected",0)+1
+                        errors.append(f"区域 {tuple(bbox)}：{audit.reason}")
+                        continue
                 score = self._candidate_score(rows, confidences, keypoint_scores)
                 if best is None or score > best[0]:
                     best = (
@@ -879,6 +901,8 @@ class NeuralBoardRecognizer:
                         confidences,
                         layout,
                         tuple(bbox),
+                        candidate_geometry,
+                        self.classifier.last_scores.copy() if isinstance(getattr(self.classifier,"last_scores",None),np.ndarray) else None,
                     )
                 # A legal board with both kings and uniformly high class
                 # confidence does not need the slower fallback regions.
@@ -892,7 +916,9 @@ class NeuralBoardRecognizer:
             self.tracking_failures = 0
             detail = errors[0] if errors else "没有候选区域"
             raise RuntimeError(f"深度模型没有可靠定位到棋盘：{detail}")
-        _, keypoints, keypoint_scores, transformed, rows, confidences, layout, chosen_bbox = best
+        _, keypoints, keypoint_scores, transformed, rows, confidences, layout, chosen_bbox, checked_geometry, chosen_scores = best
+        if chosen_scores is not None:
+            self.classifier.last_scores = chosen_scores
         self.last_search_bbox, self.last_image_size = chosen_bbox, image.size
         self.tracking_failures = 0
         self.last_layout = layout
@@ -947,7 +973,7 @@ class NeuralBoardRecognizer:
             if detection.piece is not None
         }
         circle_started = time.perf_counter()
-        self.last_geometry = self._refine_geometry_from_pieces(
+        self.last_geometry = checked_geometry or self._refine_geometry_from_pieces(
             image,
             self.last_geometry,
             board,
@@ -966,6 +992,11 @@ class NeuralBoardRecognizer:
             (time.perf_counter() - circle_started) * 1000,
             1,
         )
+        if minimum_geometry_confidence > 0 and not allow_ambiguous:
+            from grid_geometry import audit_grid
+            self.last_grid_audit = audit_grid(image, self.last_geometry, board)
+            # Recognition remains available for manual review. Automation
+            # separately requires this evidence before accepting the geometry.
         return grid, detections
 
     @staticmethod
@@ -1023,7 +1054,7 @@ class PieceRecognizer:
                   minimum_geometry_confidence: float = 0.0,
                   cancelled=None,
                   tracking_only: bool = False,
-                  allow_ambiguous: bool = False) -> tuple[Image.Image, list[Detection]]:
+                  allow_ambiguous: bool = False, require_grid: bool = False) -> tuple[Image.Image, list[Detection]]:
         previous_geometry = self.last_geometry
         try:
             result = self._ensure_neural().recognize(
@@ -1032,6 +1063,7 @@ class PieceRecognizer:
                 cancelled=cancelled,
                 tracking_only=tracking_only,
                 allow_ambiguous=allow_ambiguous,
+                require_grid=require_grid,
             )
             self.last_backend = "onnx"
             self.last_error = ""

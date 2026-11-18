@@ -103,6 +103,24 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(self.app.follow_best_var.get())
         self.assertTrue(self.app.always_on_top_var.get())
 
+    def test_autoplay_result_populates_chart_without_manual_analysis(self):
+        from automation import AutomationState
+        app = self.app
+        app.mouse_auto_running = True
+        app.mouse_auto_session_id = 51
+        app.mouse_auto_state = AutomationState.THINKING
+        line = AnalysisLine(1, 20, "cp", 25, ["b2e2"], (700, 200, 100))
+        payload = (51, dict(app.board), app.side, app.engine_history_fen,
+                   tuple(app.engine_move_history), line)
+        app.result_queue.put(("mouse_evaluation", payload))
+        app._poll_results()
+        self.assertEqual(app.ui.winrate_chart.history.points[0], (70, 20, 10))
+        app.result_queue.put(("mouse_evaluation", (50, *payload[1:-1],
+            AnalysisLine(1, 20, "cp", 25, ["b2e2"], (0, 0, 1000)))))
+        app._poll_results()
+        self.assertEqual(app.ui.winrate_chart.history.points[0], (70, 20, 10))
+        app.mouse_auto_running = False
+
     def test_approved_workbench_has_author_and_defaults_to_auto_player(self):
         self.assertEqual(self.app.ui.author_label.cget("text"), "作者：第一少帅")
         self.assertTrue(self.app.auto_player_side_var.get())

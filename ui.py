@@ -8,6 +8,7 @@ from tkinter import font as tkfont, ttk
 
 from core import FILES, PIECE_NAMES, PUZZLE_FEN, START_FEN, describe_move, score_text
 from ui_widgets import RoundedPanel, ToggleSwitch, animate_board, install_round_styles
+from winrate import WinrateChart
 
 BG = "#F6F5F1"
 PANEL = "#FFFEFA"
@@ -421,6 +422,11 @@ class WorkspaceView:
         pv_scroll.pack(side="right", fill="y")
         app.pv_text.pack(side="left", fill="both", expand=True)
         app.pv_text.configure(state="disabled")
+        self._label(panel, "胜率曲线 · 红方视角", "Muted.TLabel").pack(anchor="w", pady=(p(9), p(4)))
+        self.winrate_chart = WinrateChart(panel, scale=self.scale)
+        self.winrate_chart.pack(fill="x")
+        self._label(panel, "引擎估计，非胜负保证；横轴为已走步数（半回合）", "Muted.TLabel",
+                    wraplength=p(280), font=(FONT, -p(10))).pack(anchor="w", pady=(p(3), p(5)))
 
     def _switch_row(self, panel, text, variable, command=None, hint=None):
         row = ttk.Frame(panel, style="Panel.TFrame")
@@ -567,6 +573,10 @@ class WorkspaceView:
 
     def update_analysis(self):
         app = self.app
+        chart = getattr(self, "winrate_chart", None)
+        if chart is not None:
+            chart.history.sync(app.engine_history_fen, app.engine_move_history)
+            chart.redraw()
         busy = app.analysis_running
         line = app._current_analysis_line()
         children = app.tree.get_children()
@@ -614,6 +624,13 @@ class WorkspaceView:
         self.undo_button.configure(state="normal" if app.undo_stack else "disabled")
         self.redo_button.configure(state="normal" if app.redo_stack else "disabled")
         self._schedule_layout_refresh()
+
+    def record_winrate(self, line):
+        app = self.app
+        if app.board == app.analysis_board and app.side == app.analysis_side:
+            self.winrate_chart.history.record(app.engine_history_fen, app.engine_move_history,
+                                              line, app.analysis_side)
+            self.winrate_chart.redraw()
 
     def close(self):
         self.progress.stop()
